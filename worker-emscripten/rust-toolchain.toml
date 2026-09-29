@@ -1,0 +1,5 @@
+# emscripten の std はまだ stable に無いので beta (workers-rs の examples/emscripten-* と同じ)
+[toolchain]
+channel = "beta-2026-09-20"
+targets = ["wasm32-unknown-emscripten"]
+components = ["rustfmt", "clippy"]
