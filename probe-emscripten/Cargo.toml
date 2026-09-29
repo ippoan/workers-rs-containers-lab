@@ -1,0 +1,58 @@
+# wasm32-unknown-emscripten 版の probe。probe-unknown と同じ口 (../probe-shared/ の同じコード) を
+# emscripten でビルドし、ring (C / asm を含む) や printpdf がこのターゲットで動くかを比べる。
+# emscripten の target・beta toolchain・下の [patch] が混ざらないよう、自前の Cargo.lock を持つ独立 workspace。
+# 依存の版は rust-alc-api 15bf45e の Cargo.lock に揃える (probe-unknown と同じ)。
+[package]
+name = "probe-emscripten"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# emscripten は cdylib ではリンクできないので bin (src/main.rs の空の main)
+
+[workspace]
+
+[features]
+# ring は既定で外す: ring 0.17.14 の C / asm は emcc でコンパイルできるが、`SystemRandom` の `SecureRandom` 実装が
+# target_os の許可リスト (src/rand.rs) に emscripten を含まず、jsonwebtoken の RS256 署名と写した encrypt_secret
+# (どちらも SystemRandom を使う) が E0277 でコンパイルできない。/sign はその 2 つを {"unsupported": …} で返す。
+# `worker-build --emscripten --release -- --features ring` で同じエラーを再現できる
+default = []
+ring = ["dep:ring", "dep:jsonwebtoken"]
+# printpdf も既定で外す: printpdf 0.8.2 (0.12.8 も) は [lib] crate-type = ["cdylib", "rlib"] で、cargo は依存の
+# cdylib もリンクする。emscripten の cdylib (SIDE_MODULE) は worker-build の -Crelocation-model=static では
+# wasm-ld が `relocation R_WASM_MEMORY_ADDR_SLEB cannot be used against symbol …; recompile with -fPIC` で落ちる。
+# /pdf は 501 {"unsupported": …}。`-- --features pdf` で同じエラーを再現できる
+pdf = ["dep:printpdf"]
+
+[dependencies]
+base64 = "=0.22.1"
+encoding_rs = "=0.8.35"
+jsonwebtoken = { version = "=9.3.1", optional = true }
+printpdf = { version = "=0.8.2", optional = true }
+# emscripten の getrandom は getentropy を使うので、probe-unknown の `js` / `wasm32_unknown_unknown_js` は要らない
+ring = { version = "=0.17.14", optional = true }
+rsa = { version = "=0.9.10", features = ["getrandom", "sha2"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "=0.10.9"
+# worker-build (CI と wrangler.toml の [build]) と同じ 0.8.7 に固定する
+worker = { version = "=0.8.7", features = ["experimental_tokio"] }
+# probe-unknown と同じく deflate だけ (rust-alc-api は default features)
+zip = { version = "=2.4.2", default-features = false, features = ["deflate"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+# emscripten では unwind が未対応
+panic = "abort"
+
+# workers-rs の examples/emscripten-* と同じ patchset (worker-emscripten と同じ)
+[patch."https://github.com/guybedford/libc"]
+libc = { git = "https://github.com/rust-lang/libc", branch = "libc-0.2" }
+[patch.crates-io]
+libc = { git = "https://github.com/rust-lang/libc", branch = "libc-0.2" }
+tokio = { git = "https://github.com/guybedford/tokio", tag = "1.53.1-cf.emscripten" }
+tokio-macros = { git = "https://github.com/guybedford/tokio", tag = "1.53.1-cf.emscripten" }
+mio = { git = "https://github.com/guybedford/mio", tag = "1.2.3-cf.emscripten" }

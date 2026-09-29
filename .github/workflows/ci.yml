@@ -1,7 +1,9 @@
 # 検査と build。main への push (と手動の workflow_dispatch) のときだけ、検査がすべて通った後に
 # staging へデプロイする: まず DO と Container の lab-db (deploy-staging-db)、その後で A (deploy-staging) と
 # B (deploy-staging-emscripten) を並列に。A・B の workers.dev は Cloudflare Access で保護済みが前提で、
-# デプロイ直後に「token 無しでは Access に止められる」ことを確かめる。README 参照。
+# デプロイ直後に「token 無しでは Access に止められる」ことを確かめる。
+# probe (probe-unknown / probe-emscripten: ZIP・署名・PDF がターゲットごとに動くか) は DB を使わないので、
+# 上とは独立に、自分の build が通ったら並列にデプロイする。README 参照。
 name: CI
 
 on:
@@ -28,11 +30,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: 外から直接届かないことの検査
-        run: bash scripts/check-exposure.sh worker-unknown/wrangler.toml worker-emscripten/wrangler.toml --private lab-db/wrangler.toml
+        run: bash scripts/check-exposure.sh worker-unknown/wrangler.toml worker-emscripten/wrangler.toml probe-unknown/wrangler.toml probe-emscripten/wrangler.toml --private lab-db/wrangler.toml
       - name: check-exposure.sh の陰性対照
         run: bash scripts/check-exposure-test.sh worker-unknown/wrangler.toml
       - name: check-exposure.sh の陰性対照 (worker-emscripten)
         run: bash scripts/check-exposure-test.sh worker-emscripten/wrangler.toml
+      - name: check-exposure.sh の陰性対照 (probe-unknown)
+        run: bash scripts/check-exposure-test.sh probe-unknown/wrangler.toml
+      - name: check-exposure.sh の陰性対照 (probe-emscripten)
+        run: bash scripts/check-exposure-test.sh probe-emscripten/wrangler.toml
       - name: check-exposure.sh の陰性対照 (lab-db、--private)
         run: bash scripts/check-exposure-test.sh --private lab-db/wrangler.toml
 
@@ -116,6 +122,71 @@ jobs:
       - run: worker-build --emscripten --release
       - name: bundle サイズ (上限 10MB は gzip 後)
         run: bash ../bench/bundle-size.sh lab-emscripten build/index_bg.wasm
+
+  # probe (wasm32-unknown-unknown)。/zip・/sign・/pdf。ring の C は ubuntu-latest の clang で wasm32 向けにコンパイルされる。
+  # PDF のフォント (9.6 MB) を同梱するので、gzip 後は上限 10MB の近く (bundle-size.sh が超えたら落とす)
+  probe-unknown:
+    name: probe-unknown (wasm32-unknown-unknown)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: probe-unknown
+    steps:
+      - uses: actions/checkout@v4
+      # 版は probe-unknown/rust-toolchain.toml と揃える
+      - uses: dtolnay/rust-toolchain@1.92.0
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+      - uses: swatinem/rust-cache@v2
+        with:
+          # build の job とデプロイの job で同じキャッシュを使う (既定のキーは job 名を含み、デプロイから引けない)
+          shared-key: probe-unknown
+          workspaces: probe-unknown
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo fmt --check
+      - run: cargo clippy --target wasm32-unknown-unknown -- -D warnings
+      # worker-build の版は wrangler.toml の [build] command と Cargo.toml の worker と揃える
+      - run: cargo install -q worker-build@0.8.7 --locked
+      - run: worker-build --release
+      - name: bundle サイズ (上限 10MB は gzip 後)
+        run: bash ../bench/bundle-size.sh probe-unknown build/index_bg.wasm
+
+  # probe (wasm32-unknown-emscripten)。toolchain は probe-emscripten/rust-toolchain.toml (worker-emscripten と同じ日付つきの beta)。
+  # ring と printpdf はこのターゲットでビルドできないので feature で外れている (Cargo.toml の [features])。
+  # ring を外しているので clippy に emcc は要らない
+  probe-emscripten:
+    name: probe-emscripten (wasm32-unknown-emscripten)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: probe-emscripten
+    steps:
+      - uses: actions/checkout@v4
+      - name: toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: swatinem/rust-cache@v2
+        with:
+          # build の job とデプロイの job で同じキャッシュを使う (既定のキーは job 名を含み、デプロイから引けない)
+          shared-key: probe-emscripten
+          workspaces: probe-emscripten
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # emsdk の置き場は worker-emscripten と同じキー (保存は worker-emscripten の job に任せ、ここは復元だけ)
+      - uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/worker-build
+          key: worker-build-0.8.7-emsdk-${{ runner.os }}
+      - run: cargo fmt --check
+      - run: cargo clippy --target wasm32-unknown-emscripten -- -D warnings
+      # worker-build の版は wrangler.toml の [build] command と Cargo.toml の worker と揃える
+      - run: cargo install -q worker-build@0.8.7 --locked
+      - run: worker-build --emscripten --release
+      - name: bundle サイズ (上限 10MB は gzip 後。JS glue も出す)
+        run: |
+          bash ../bench/bundle-size.sh probe-emscripten build/index_bg.wasm
+          line="probe-emscripten glue: raw=$(stat -c%s build/index.js) B / gzip=$(gzip -9c build/index.js | wc -c) B"
+          echo "$line"
+          echo "$line" >>"$GITHUB_STEP_SUMMARY"
 
   # DO LabDb と Container を持つスクリプト (A・B が script_name で参照する)
   lab-db:
@@ -362,15 +433,163 @@ jobs:
           echo "::error::token 無しで 12 回とも 404 (workers.dev のルートが行き渡らない。Access の状態も dashboard で確かめること)"
           exit 1
 
+  # probe-unknown の staging。DB を使わないので deploy-staging-db を待たず、ほかのデプロイとも並列。
+  # 伏せ方と Access の検査は deploy-staging と同じ
+  deploy-staging-probe-unknown:
+    name: deploy staging (lab-probe-unknown-staging)
+    needs: [exposure, probe-unknown]
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-staging-probe-unknown
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: probe-unknown
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # 版は probe-unknown/rust-toolchain.toml と揃える
+      - uses: dtolnay/rust-toolchain@1.92.0
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: swatinem/rust-cache@v2
+        with:
+          # build の job とデプロイの job で同じキャッシュを使う (既定のキーは job 名を含み、デプロイから引けない)
+          shared-key: probe-unknown
+          workspaces: probe-unknown
+          save-if: false
+      # wrangler.toml の [build] command と同じ版 (入っていれば [build] の cargo install は即終わる)
+      - run: cargo install -q worker-build@0.8.7 --locked
+      # 伏せ方は deploy-staging と同じ (staging の URL と 32 桁の hex を ::add-mask:: して置換)
+      - name: wrangler deploy --env staging
+        id: deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          log="$RUNNER_TEMP/deploy.log"
+          status=0
+          npx -y wrangler@4.143.0 deploy --env staging >"$log" 2>&1 || status=$?
+          # 何かを出す前に mask を登録する
+          grep -oE '[0-9A-Fa-f]{32}' "$log" | sort -u | while read -r hex; do
+            echo "::add-mask::${hex}"
+          done
+          url=$(grep -oE 'https://[A-Za-z0-9.-]+\.workers\.dev' "$log" | head -1 || true)
+          if [ -n "$url" ]; then
+            echo "::add-mask::${url}"
+            echo "::add-mask::${url#https://}"
+            echo "$url" >"$RUNNER_TEMP/staging-url"
+          fi
+          sed -E -e 's#[A-Za-z0-9.-]+\.workers\.dev#<staging>#g' -e 's#[0-9A-Fa-f]{32}#<account>#g' "$log"
+          [ "$status" = 0 ] || exit "$status"
+          [ -n "$url" ] || { echo "::error::wrangler の出力に staging の URL が無い"; exit 1; }
+      # deploy-staging と同じ検査 (404 だけ 10 秒おきに最大 12 回待つ。200 などは即 fail)
+      - name: token 無しの /sign が Access に止められる
+        if: ${{ !cancelled() && steps.deploy.outcome != 'skipped' }}
+        run: |
+          if [ ! -s "$RUNNER_TEMP/staging-url" ]; then
+            echo "::warning::wrangler の出力に staging の URL が無いので Access の検査を skip (Worker の公開状態は dashboard で確かめること)"
+            exit 0
+          fi
+          url=$(cat "$RUNNER_TEMP/staging-url")
+          for i in $(seq 1 12); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "${url}/sign")
+            echo "[${i}/12] token 無しの GET <staging>/sign → ${code}"
+            case "$code" in
+              302|403) exit 0 ;;
+              404) [ "$i" -lt 12 ] && sleep 10 ;;
+              *) echo "::error::token 無しで ${code} (Access が効いていない。直ちに止めること)"; exit 1 ;;
+            esac
+          done
+          echo "::error::token 無しで 12 回とも 404 (workers.dev のルートが行き渡らない。Access の状態も dashboard で確かめること)"
+          exit 1
+
+  # probe-emscripten の staging。DB を使わないので deploy-staging-db を待たず、ほかのデプロイとも並列。
+  # 伏せ方と Access の検査は deploy-staging と同じ
+  deploy-staging-probe-emscripten:
+    name: deploy staging (lab-probe-emscripten-staging)
+    needs: [exposure, probe-emscripten]
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-staging-probe-emscripten
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: probe-emscripten
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: swatinem/rust-cache@v2
+        with:
+          # build の job とデプロイの job で同じキャッシュを使う (既定のキーは job 名を含み、デプロイから引けない)
+          shared-key: probe-emscripten
+          workspaces: probe-emscripten
+          save-if: false
+      - uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/worker-build
+          key: worker-build-0.8.7-emsdk-${{ runner.os }}
+      # wrangler.toml の [build] command と同じ版 (入っていれば [build] の cargo install は即終わる)
+      - run: cargo install -q worker-build@0.8.7 --locked
+      # 伏せ方は deploy-staging と同じ (staging の URL と 32 桁の hex を ::add-mask:: して置換)
+      - name: wrangler deploy --env staging
+        id: deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          log="$RUNNER_TEMP/deploy.log"
+          status=0
+          npx -y wrangler@4.143.0 deploy --env staging >"$log" 2>&1 || status=$?
+          # 何かを出す前に mask を登録する
+          grep -oE '[0-9A-Fa-f]{32}' "$log" | sort -u | while read -r hex; do
+            echo "::add-mask::${hex}"
+          done
+          url=$(grep -oE 'https://[A-Za-z0-9.-]+\.workers\.dev' "$log" | head -1 || true)
+          if [ -n "$url" ]; then
+            echo "::add-mask::${url}"
+            echo "::add-mask::${url#https://}"
+            echo "$url" >"$RUNNER_TEMP/staging-url"
+          fi
+          sed -E -e 's#[A-Za-z0-9.-]+\.workers\.dev#<staging>#g' -e 's#[0-9A-Fa-f]{32}#<account>#g' "$log"
+          [ "$status" = 0 ] || exit "$status"
+          [ -n "$url" ] || { echo "::error::wrangler の出力に staging の URL が無い"; exit 1; }
+      # deploy-staging と同じ検査 (404 だけ 10 秒おきに最大 12 回待つ。200 などは即 fail)
+      - name: token 無しの /sign が Access に止められる
+        if: ${{ !cancelled() && steps.deploy.outcome != 'skipped' }}
+        run: |
+          if [ ! -s "$RUNNER_TEMP/staging-url" ]; then
+            echo "::warning::wrangler の出力に staging の URL が無いので Access の検査を skip (Worker の公開状態は dashboard で確かめること)"
+            exit 0
+          fi
+          url=$(cat "$RUNNER_TEMP/staging-url")
+          for i in $(seq 1 12); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "${url}/sign")
+            echo "[${i}/12] token 無しの GET <staging>/sign → ${code}"
+            case "$code" in
+              302|403) exit 0 ;;
+              404) [ "$i" -lt 12 ] && sleep 10 ;;
+              *) echo "::error::token 無しで ${code} (Access が効いていない。直ちに止めること)"; exit 1 ;;
+            esac
+          done
+          echo "::error::token 無しで 12 回とも 404 (workers.dev のルートが行き渡らない。Access の状態も dashboard で確かめること)"
+          exit 1
+
   # green の PR を merge する (ippoan/ci-workflows の reusable。merge は GitHub App の token で行う)。
-  # deploy-staging-db / deploy-staging / deploy-staging-emscripten は main への push 限定なので、PR の merge を gate しない (deploy_gate_ignore)
+  # deploy-staging-* は main への push 限定なので、PR の merge を gate しない (deploy_gate_ignore)
   auto-merge:
     name: Auto Merge
-    needs: [exposure, container, lab-db, worker-unknown, worker-emscripten]
-    if: github.event_name == 'pull_request' && needs.exposure.result == 'success' && needs.container.result == 'success' && needs.lab-db.result == 'success' && needs.worker-unknown.result == 'success' && needs.worker-emscripten.result == 'success'
+    needs: [exposure, container, lab-db, worker-unknown, worker-emscripten, probe-unknown, probe-emscripten]
+    if: github.event_name == 'pull_request' && needs.exposure.result == 'success' && needs.container.result == 'success' && needs.lab-db.result == 'success' && needs.worker-unknown.result == 'success' && needs.worker-emscripten.result == 'success' && needs.probe-unknown.result == 'success' && needs.probe-emscripten.result == 'success'
     uses: ippoan/ci-workflows/.github/workflows/auto-merge.yml@main
     with:
-      deploy_gate_ignore: deploy-staging-db,deploy-staging,deploy-staging-emscripten
+      deploy_gate_ignore: deploy-staging-db,deploy-staging,deploy-staging-emscripten,deploy-staging-probe-unknown,deploy-staging-probe-emscripten
     permissions:
       contents: write
       pull-requests: write

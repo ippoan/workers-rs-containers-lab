@@ -1,0 +1,45 @@
+# wasm32-unknown-unknown 版の probe。rust-alc-api の「Worker に移しにくい処理」(dtako の ZIP・RS256 / AES-GCM・
+# 日本語 PDF) がこのターゲットで動くかを測る。処理のコードは ../probe-shared/ (probe-emscripten と共通)。
+# DB 比較の worker (worker-unknown) の bundle を汚さないよう、自前の Cargo.lock を持つ独立 workspace。
+# 依存の版は rust-alc-api 15bf45e の Cargo.lock に揃える。
+[package]
+name = "probe-unknown"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[workspace]
+
+[features]
+default = ["ring", "pdf"]
+# jsonwebtoken (ring バックエンド) の RS256 と ring の AES-256-GCM。ビルドできないターゲットでは外し、
+# /sign はその 2 つを {"unsupported": …} で返す
+ring = ["dep:ring", "dep:jsonwebtoken"]
+# printpdf + 同梱フォント (NotoSansJP 9.6 MB)。外すと /pdf は 501 {"unsupported": …}
+pdf = ["dep:printpdf"]
+
+[dependencies]
+base64 = "=0.22.1"
+encoding_rs = "=0.8.35"
+# rsa (rand_core 0.6) の OsRng を wasm32-unknown-unknown で crypto.getRandomValues に向ける
+getrandom = { version = "0.2", features = ["js"] }
+jsonwebtoken = { version = "=9.3.1", optional = true }
+printpdf = { version = "=0.8.2", optional = true }
+ring = { version = "=0.17.14", optional = true, features = ["wasm32_unknown_unknown_js"] }
+rsa = { version = "=0.9.10", features = ["getrandom", "sha2"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "=0.10.9"
+# worker-build (CI と wrangler.toml の [build]) と同じ 0.8.7 に固定する
+worker = "=0.8.7"
+# rust-alc-api は zip = "2" の default features (bzip2 / zstd / xz の C ライブラリを含む)。dtako の ZIP は
+# deflate なので、ここでは deflate (pure Rust の flate2 rust_backend) だけにする
+zip = { version = "=2.4.2", default-features = false, features = ["deflate"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
