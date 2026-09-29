@@ -111,26 +111,41 @@ jobs:
       - run: cargo install -q worker-build@0.8.7 --locked
       # wrangler は DO への CONNECT と Containers に対応する版に固定する。Container の image は
       # ubuntu-latest の docker で build して push する
+      # wrangler の出力は $RUNNER_TEMP/deploy.log に取り、伏せてから出す。ログファイルそのもの
+      # (deploy.log も wrangler が書く ~/.config/.wrangler/logs/*.log も) は出さず、artifact にも上げない。
+      #   - staging の URL (実ホスト名): ::add-mask:: + <staging> に置換
+      #   - 32 桁の hex (account ID。API のエラー文や registry のパスに平文で出る): ::add-mask:: + <account> に置換
       - name: wrangler deploy --env staging
+        id: deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: |
           log="$RUNNER_TEMP/deploy.log"
           status=0
           npx -y wrangler@4.143.0 deploy --env staging >"$log" 2>&1 || status=$?
+          # 何かを出す前に mask を登録する
+          grep -oE '[0-9A-Fa-f]{32}' "$log" | sort -u | while read -r hex; do
+            echo "::add-mask::${hex}"
+          done
           url=$(grep -oE 'https://[A-Za-z0-9.-]+\.workers\.dev' "$log" | head -1 || true)
           if [ -n "$url" ]; then
             echo "::add-mask::${url}"
             echo "::add-mask::${url#https://}"
             echo "$url" >"$RUNNER_TEMP/staging-url"
           fi
-          # 実ホスト名を伏せて出す (mask に加えて置換もしておく)
-          sed -E 's#[A-Za-z0-9.-]+\.workers\.dev#<staging>#g' "$log"
+          sed -E -e 's#[A-Za-z0-9.-]+\.workers\.dev#<staging>#g' -e 's#[0-9A-Fa-f]{32}#<account>#g' "$log"
           [ "$status" = 0 ] || exit "$status"
           [ -n "$url" ] || { echo "::error::wrangler の出力に staging の URL が無い"; exit 1; }
-      # Access が効いていること: token 無しは Worker に届かず、Access が 302 (ログインへ) か 403 を返す
+      # Access が効いていること: token 無しは Worker に届かず、Access が 302 (ログインへ) か 403 を返す。
+      # deploy が途中で失敗しても Worker はアップロード済みのことがあるので、deploy が走った限り必ず確かめる
+      # (URL が取れなければ warning を出して skip)
       - name: token 無しの /query が Access に止められる
+        if: ${{ !cancelled() && steps.deploy.outcome != 'skipped' }}
         run: |
+          if [ ! -s "$RUNNER_TEMP/staging-url" ]; then
+            echo "::warning::wrangler の出力に staging の URL が無いので Access の検査を skip (Worker の公開状態は dashboard で確かめること)"
+            exit 0
+          fi
           url=$(cat "$RUNNER_TEMP/staging-url")
           code=$(curl -s -o /dev/null -w '%{http_code}' "${url}/query")
           echo "token 無しの GET <staging>/query → ${code}"
@@ -138,7 +153,6 @@ jobs:
             302|403) ;;
             *) echo "::error::token 無しで ${code} (Access が効いていない。直ちに止めること)"; exit 1 ;;
           esac
-
   # green の PR を merge する (ippoan/ci-workflows の reusable。merge は GitHub App の token で行う)。
   # deploy-staging は main への push 限定なので、PR の merge を gate しない (deploy_gate_ignore)
   auto-merge:
