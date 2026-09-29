@@ -74,6 +74,9 @@ rsa 0.9.10 / printpdf 0.8.2)。
     flush はこの並びを前提にし、入力は運行NO 順の生成器 (`zip_probe::generate_sorted`) で作る。連続していない運行が出たら
     `<CSV>.part<n>` として別に PUT し、`runs > groups` (= `match: false`) で分かるようにする (結合はしない)
   - 運行NO 順の KUDGIVT は混ざった順より縮むので、同じ N MB でも CSV は大きい (KUDGIVT の SJIS は 1 MB で 6.7 MB = copy / stream の入力の約 1.5 倍、20 MB で 169 MB)
+  - **CPU の重さは Workers Logs / Observability のリクエストごとの CPU 時間で比べる**。Worker 内の時計は I/O まで進まないので
+    `process.process_ms` は staging ではほぼ 0 になり (`put_wait_ms` は PUT の I/O を含むので進む)、手元の wall には入口の
+    拠点のぶれが乗る。応答で見るのは heap_peak / 線形メモリ / 件数 (`match`・`runs`・`groups`・`puts.count`)
   - ローカル (`wrangler dev --env staging`、手元の R2) の実測: 1 MB は heap_peak 1.7 MiB、20 MB は 20.8 MiB
     (うち ZIP 本体 20.0 MiB)。どちらも `match: true`、PUT 6000 件
   - R2 の bucket `lab-probe-staging` は deploy 時に無ければ wrangler が作る (4.143.0 の resource provisioning。`bucket_name`
