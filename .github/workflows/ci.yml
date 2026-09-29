@@ -74,6 +74,8 @@ jobs:
           components: rustfmt, clippy
       - uses: swatinem/rust-cache@v2
         with:
+          # build の job とデプロイの job で同じキャッシュを使う (既定のキーは job 名を含み、デプロイから引けない)
+          shared-key: worker-unknown
           workspaces: worker-unknown
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --check
@@ -98,6 +100,8 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
       - uses: swatinem/rust-cache@v2
         with:
+          # build の job とデプロイの job で同じキャッシュを使う (既定のキーは job 名を含み、デプロイから引けない)
+          shared-key: worker-emscripten
           workspaces: worker-emscripten
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # worker-build が入れる emsdk (6.0.10) と、それに当てる patch の置き場
@@ -129,6 +133,8 @@ jobs:
           components: rustfmt, clippy
       - uses: swatinem/rust-cache@v2
         with:
+          # build の job とデプロイの job で同じキャッシュを使う (既定のキーは job 名を含み、デプロイから引けない)
+          shared-key: lab-db
           workspaces: lab-db
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --check
@@ -167,6 +173,8 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: swatinem/rust-cache@v2
         with:
+          # build の job とデプロイの job で同じキャッシュを使う (既定のキーは job 名を含み、デプロイから引けない)
+          shared-key: lab-db
           workspaces: lab-db
           save-if: false
       # wrangler.toml の [build] command と同じ版 (入っていれば [build] の cargo install は即終わる)
@@ -222,6 +230,8 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: swatinem/rust-cache@v2
         with:
+          # build の job とデプロイの job で同じキャッシュを使う (既定のキーは job 名を含み、デプロイから引けない)
+          shared-key: worker-unknown
           workspaces: worker-unknown
           save-if: false
       # wrangler.toml の [build] command と同じ版 (入っていれば [build] の cargo install は即終わる)
@@ -299,6 +309,8 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
       - uses: swatinem/rust-cache@v2
         with:
+          # build の job とデプロイの job で同じキャッシュを使う (既定のキーは job 名を含み、デプロイから引けない)
+          shared-key: worker-emscripten
           workspaces: worker-emscripten
           save-if: false
       - uses: actions/cache/restore@v4
