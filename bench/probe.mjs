@@ -7,8 +7,10 @@
 //   PROBE_UNKNOWN_URL=https://<probe-unknown の staging> \
 //   PROBE_EMSCRIPTEN_URL=https://<probe-emscripten の staging> \
 //   CF_ACCESS_CLIENT_ID=... CF_ACCESS_CLIENT_SECRET=... \
-//   node bench/probe.mjs [-n 10] [--mb 1,5,10,20] [--json]
+//   node bench/probe.mjs [-n 10] [--mb 1,5,10,20] [--modes flush,stream,copy] [--only zip,sign,pdf] [--timeout 900] [--json]
 //
+// --modes は /zip で叩く mode、--only は叩くエンドポイント (既定はどちらも全部)。--timeout は 1 回の上限 (秒)。
+// 超えた回は打ち切って timeout と数える (全回 timeout ならセルは timeout)。
 // 片方の URL だけでも動く (無い方は表で "-")。ローカルの wrangler dev を叩くときは Access の env は要らない。
 //
 // 列:
@@ -36,6 +38,24 @@ const mbIdx = args.indexOf("--mb");
 const mbs = (mbIdx >= 0 ? args[mbIdx + 1] : "1,5,10,20").split(",").map(Number);
 if (mbs.some((m) => !Number.isInteger(m) || m < 1 || m > 20)) {
   console.error("--mb は 1..=20 の整数をカンマ区切りで");
+  process.exit(2);
+}
+const modesIdx = args.indexOf("--modes");
+const modes = (modesIdx >= 0 ? args[modesIdx + 1] : "flush,stream,copy").split(",");
+if (modes.some((m) => !["flush", "stream", "copy"].includes(m))) {
+  console.error("--modes は flush,stream,copy のどれかをカンマ区切りで");
+  process.exit(2);
+}
+const onlyIdx = args.indexOf("--only");
+const only = (onlyIdx >= 0 ? args[onlyIdx + 1] : "zip,sign,pdf").split(",");
+if (only.some((e) => !["zip", "sign", "pdf"].includes(e))) {
+  console.error("--only は zip,sign,pdf のどれかをカンマ区切りで");
+  process.exit(2);
+}
+const timeoutIdx = args.indexOf("--timeout");
+const timeoutSec = timeoutIdx >= 0 ? Number(args[timeoutIdx + 1]) : 900;
+if (!(timeoutSec > 0)) {
+  console.error("--timeout は正の秒数");
   process.exit(2);
 }
 
@@ -75,12 +95,15 @@ async function once(base, path) {
   const url = new URL(path, base);
   const t0 = performance.now();
   let res;
+  let buf;
   try {
-    res = await fetch(url, { headers, redirect: "manual" });
+    // signal は本文を読み終えるまで効く
+    res = await fetch(url, { headers, redirect: "manual", signal: AbortSignal.timeout(timeoutSec * 1000) });
+    buf = Buffer.from(await res.arrayBuffer());
   } catch (e) {
+    if (e.name === "TimeoutError") return { status: "timeout", ok: false };
     return { wall: performance.now() - t0, status: "fetch-error", ok: false };
   }
-  const buf = Buffer.from(await res.arrayBuffer());
   const wall = performance.now() - t0;
   const out = { wall, status: res.status, ok: false };
   const type = res.headers.get("content-type") ?? "";
@@ -156,10 +179,13 @@ async function run(base, path) {
   };
 }
 
+// mb ごとに flush → stream → copy の順 (--modes の並びによらない)
 const paths = [
-  ...mbs.flatMap((m) => [`/zip?mb=${m}&mode=flush`, `/zip?mb=${m}&mode=stream`, `/zip?mb=${m}&mode=copy`]),
-  "/sign",
-  "/pdf",
+  ...(only.includes("zip")
+    ? mbs.flatMap((m) => ["flush", "stream", "copy"].filter((d) => modes.includes(d)).map((d) => `/zip?mb=${m}&mode=${d}`))
+    : []),
+  ...(only.includes("sign") ? ["/sign"] : []),
+  ...(only.includes("pdf") ? ["/pdf"] : []),
 ];
 const results = {};
 for (const [name, base] of targets) {
@@ -178,6 +204,7 @@ if (asJson) {
   const cell = (r) => {
     if (!r) return "-";
     if (r.unsupported) return "unsupported";
+    if (r.fails.timeout === r.n) return `timeout (>${timeoutSec}s ×${r.n})`;
     const f = Object.entries(r.fails).map(([s, c]) => `${s}×${c}`).join(" ");
     return `${ms(r.wall_p50)} / ${ms(r.worker_p50)} / ${mb(r.mem_max)} / ${mb(r.heap_max)} / ${r.ok}/${r.n}${f ? ` (${f})` : ""}`;
   };
@@ -190,7 +217,7 @@ if (asJson) {
     if (!results[t]) continue;
     const colos = [...new Set(Object.values(results[t]).flatMap((r) => r.colos))];
     const sign = results[t]["/sign"];
-    console.log(`${t}: worker colo=${colos.join(",") || "?"} / sign 暖機=${JSON.stringify(sign.warmup)}`);
+    console.log(`${t}: worker colo=${colos.join(",") || "?"}${sign ? ` / sign 暖機=${JSON.stringify(sign.warmup)}` : ""}`);
   }
   for (const p of paths.filter((p) => p.endsWith("mode=flush"))) {
     const r = results.unknown?.[p];
