@@ -79,8 +79,8 @@ bench/              bundle-size.sh / measure.mjs
   DO が最初に作られるときだけで、既にある DO は動かない。
 - DO の移し替え: LabDb はかつて A (`lab-unknown-staging`) にあった。中継だけで状態を持たないので、`transferred_classes`
   で移さず、`lab-db-staging` で新しく作り (migrations v1 `new_sqlite_classes`)、A 側の古い class は A の migrations v2
-  (`deleted_classes`) で消す。`deleted_classes` は「ほかの Worker が旧 namespace を bind していない」ことが条件なので、
-  切り替えの main の run で A が B の張り替えより先に走ると A が落ちうる (そのときは A の job を rerun する)。
+  (`deleted_classes`) で消す。`deleted_classes` は「ほかの Worker が旧 namespace を bind していない」ことが条件。
+  **いまは 2 段の移し替えの途中**: A は `LAB_DB` の binding を外しており、A の `/query` は 503 (`db_unavailable`) を返す。
 
 ## 公開範囲
 
@@ -100,7 +100,8 @@ bench/              bundle-size.sh / measure.mjs
      デプロイ直後に token 無しで `GET <staging>/query` を叩き、302 / 403 (Access が止めた) 以外なら job を落とす
      (ルートが行き渡るまでの 404 だけは 10 秒おきに最大 12 回待つ。200 などは即 fail)。
   staging の URL と 32 桁の hex は `::add-mask::` で伏せ、ログに実ホスト名を出さない。
-  DO の class を作り直す回は、A の job が 1 回落ちることがある (B の張り替え後に rerun で通る)。
+  DO の class を作り直す回は、同じクラス名への binding と `deleted_classes` を同時に適用できない (code 10061) ので、
+  2 段 (binding を外して消す → binding を戻す) にする。
 - デプロイの job は、対応する build の job と同じ rust-cache (`shared-key` = workspace 名) と emsdk のキャッシュを
   復元するだけで保存しない (保存は main の build の job)。worker-build の `cargo install` と worker の build を省くため。
 - 計測は CI に入れない (Access の service token は GitHub に置かない)。
