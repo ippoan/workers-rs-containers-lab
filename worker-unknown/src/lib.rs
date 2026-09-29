@@ -92,6 +92,10 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     if req.method() != Method::Get || req.path() != "/query" {
         return error_json("not_found", 404);
     }
+    // DO の binding が無い (wrangler.toml で外している) ときは、DB に繋がずに 503 を返す
+    if env.durable_object(db::LAB_DB_BINDING).is_err() {
+        return error_json("db_unavailable", 503);
+    }
     let started = Date::now().as_millis();
     let mut client = match db::connect(&env).await {
         Ok(c) => c,
