@@ -11,15 +11,21 @@
 //! - 常時起動にはしない: 最後の接続が閉じてから [`SLEEP_AFTER_MS`] 経つと alarm で Container を
 //!   止める (`@cloudflare/containers` の既定 sleepAfter と同じ 10 分)。ディスクは揮発なので、
 //!   次の起動は空の DB から作り直す (= cold start の計測はこの後に回す)
-//! - HTTP の口は `GET /where` だけ: この DO が動いている colo を text で返す (Container との距離を見るため。
-//!   `cdn-cgi/trace` を初回に 1 回だけ引き、以後はメモリの値を返す)
+//! - HTTP の口は 2 つ:
+//!   - `GET /where`: この DO が動いている colo を text で返す (Container との距離を見るため。
+//!     `cdn-cgi/trace` を初回に 1 回だけ引き、以後はメモリの値を返す)
+//!   - `GET /rtt`: DO から Container の PgBouncer へ新しく繋ぎ、`SELECT 1` を 1 回投げた往復 (ms) を text で返す
+//!     (= DO ↔ Container だけの往復。Worker が測る `rtt` は Worker → DO → Container)。Container が
+//!     止まっていれば起動せずに 503 を返す (計測のために Container を起こさない)
 
 use std::cell::{Cell, RefCell};
 use std::pin::pin;
 use std::time::Duration;
 
-use futures_util::future::{select, Either};
+use futures_util::future::{join, select, Either};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_postgres::config::SslMode;
+use tokio_postgres::{Config, NoTls};
 use wasm_bindgen::prelude::*;
 use worker::{
     console_error, console_log, durable_object, Container, Date, Delay, Env, Fetch, Request,
@@ -66,13 +72,8 @@ async fn trace_colo() -> Result<String> {
         .ok_or_else(|| "cdn-cgi/trace has no colo=".into())
 }
 
-/// 1 回の試行: PgBouncer へ繋ぎ、クライアントの最初のメッセージを送り、最初の応答を読む。
-/// 開いたソケットは `slot` に置く (失敗・時間切れのときに呼び出し側が閉じられるように)
-async fn try_upstream(
-    container: &Container,
-    first: &[u8],
-    slot: &mut Option<Socket>,
-) -> std::result::Result<Vec<u8>, String> {
+/// Container の PgBouncer へ TCP を開く
+fn open_port(container: &Container) -> std::result::Result<Socket, String> {
     let port: TcpPort = JsValue::from(
         container
             .get_tcp_port(PGBOUNCER_PORT)
@@ -82,7 +83,44 @@ async fn try_upstream(
     let raw = port
         .connect(&format!("10.0.0.1:{PGBOUNCER_PORT}"))
         .map_err(|e| format!("{e:?}"))?;
-    let upstream = slot.insert(Socket::from(raw));
+    Ok(Socket::from(raw))
+}
+
+/// DO ↔ Container の 1 往復: 繋いで handshake を済ませてから、`SELECT 1` (simple query) の往復だけを測る。
+/// connection は spawn せずに client と並べて await しきる (client を drop すると Terminate を送って終わる)
+async fn measure_rtt(container: &Container) -> std::result::Result<u64, String> {
+    let socket = open_port(container)?;
+    let mut config = Config::new();
+    config
+        .user("bench")
+        .dbname("postgres")
+        .ssl_mode(SslMode::Disable);
+    let (client, connection) = config
+        .connect_raw(socket, NoTls)
+        .await
+        .map_err(|e| format!("handshake: {e}"))?;
+    let probe = async move {
+        let t0 = Date::now().as_millis();
+        let r = client.simple_query("SELECT 1").await;
+        let dt = Date::now().as_millis() - t0;
+        drop(client);
+        r.map(|_| dt).map_err(|e| format!("SELECT 1: {e}"))
+    };
+    let (rtt, conn) = join(probe, connection).await;
+    if let Err(e) = conn {
+        console_error!("lab-db: rtt connection: {e}");
+    }
+    rtt
+}
+
+/// 1 回の試行: PgBouncer へ繋ぎ、クライアントの最初のメッセージを送り、最初の応答を読む。
+/// 開いたソケットは `slot` に置く (失敗・時間切れのときに呼び出し側が閉じられるように)
+async fn try_upstream(
+    container: &Container,
+    first: &[u8],
+    slot: &mut Option<Socket>,
+) -> std::result::Result<Vec<u8>, String> {
+    let upstream = slot.insert(open_port(container)?);
     upstream.write_all(first).await.map_err(|e| e.to_string())?;
     upstream.flush().await.map_err(|e| e.to_string())?;
     let mut reply = vec![0u8; 16 * 1024];
@@ -173,6 +211,35 @@ impl LabDb {
         }
     }
 
+    async fn where_colo(&self) -> Result<Response> {
+        let cached = self.colo.borrow().clone();
+        let colo = match cached {
+            Some(c) => c,
+            None => {
+                let c = trace_colo().await?;
+                *self.colo.borrow_mut() = Some(c.clone());
+                c
+            }
+        };
+        // 本文は colo の 3 文字だけ (Worker 側で JSON を解かずに済ませ、bundle を増やさない)
+        Response::ok(colo)
+    }
+
+    async fn rtt(&self) -> Result<Response> {
+        let container = self.container()?;
+        if !container.running() {
+            return Response::error("container not running", 503);
+        }
+        match measure_rtt(&container).await {
+            // 本文は ms の整数だけ (/where と同じく Worker 側で JSON を解かない)
+            Ok(ms) => Response::ok(ms.to_string()),
+            Err(e) => {
+                console_error!("lab-db: rtt: {e}");
+                Response::error("rtt failed", 502)
+            }
+        }
+    }
+
     async fn relay(&self, client: &mut Socket) -> Result<()> {
         let container = self.container()?;
         // tokio-postgres は StartupMessage を 1 回で書き、サーバーの応答を待つ (NoTls なので
@@ -204,20 +271,11 @@ impl worker::DurableObject for LabDb {
     }
 
     async fn fetch(&self, req: Request) -> Result<Response> {
-        if req.path() != "/where" {
-            return Response::error("LabDb accepts TCP and GET /where only", 404);
+        match req.path().as_str() {
+            "/where" => self.where_colo().await,
+            "/rtt" => self.rtt().await,
+            _ => Response::error("LabDb accepts TCP, GET /where and GET /rtt only", 404),
         }
-        let cached = self.colo.borrow().clone();
-        let colo = match cached {
-            Some(c) => c,
-            None => {
-                let c = trace_colo().await?;
-                *self.colo.borrow_mut() = Some(c.clone());
-                c
-            }
-        };
-        // 本文は colo の 3 文字だけ (Worker 側で JSON を解かずに済ませ、bundle を増やさない)
-        Response::ok(colo)
     }
 
     async fn connect(&self, mut socket: Socket) -> Result<()> {

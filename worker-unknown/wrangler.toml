@@ -27,6 +27,11 @@ preview_urls = false
 [env.staging.observability]
 enabled = true
 
+# Placement Hints: Worker の fetch handler を DO / Container (NRT) に近い AWS 東京リージョンの近くで動かす
+# (無いとリクエストを受けた拠点で動き、SIN などから DO まで往復することがある)。staging だけ
+[env.staging.placement]
+region = "aws:ap-northeast-1"
+
 [[env.staging.containers]]
 class_name = "LabDb"
 image = "../container/Dockerfile"
