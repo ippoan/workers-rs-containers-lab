@@ -133,10 +133,10 @@ pub struct FileCount {
     pub groups: usize,
 }
 
-struct Generated {
-    zip: Vec<u8>,
-    kudguri: FileCount,
-    kudgivt: FileCount,
+pub struct Generated {
+    pub zip: Vec<u8>,
+    pub kudguri: FileCount,
+    pub kudgivt: FileCount,
 }
 
 fn unko_no(i: usize) -> String {
@@ -162,22 +162,8 @@ fn sjis(s: &str) -> Vec<u8> {
     encoding_rs::SHIFT_JIS.encode(s).0.into_owned()
 }
 
-fn generate(target_bytes: u64) -> Result<Generated, zip::result::ZipError> {
-    let len = Rc::new(Cell::new(0));
-    let mut zw = zip::ZipWriter::new(Counting {
-        inner: Cursor::new(Vec::with_capacity(target_bytes as usize + 64 * 1024)),
-        len: len.clone(),
-    });
-    let opts = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated);
-    let mut rng = Rng(SEED);
-
-    // KUDGURI: 運行ごとに 1 行
-    let mut kudguri = FileCount {
-        groups: UNKO_COUNT,
-        rows: UNKO_COUNT,
-        ..FileCount::default()
-    };
+/// KUDGURI.csv (運行ごとに 1 行、運行NO 順) の本文
+fn kudguri_text(rng: &mut Rng) -> String {
     let mut text = String::with_capacity(UNKO_COUNT * 200);
     text.push_str(KUDGURI_HEADER);
     text.push('\n');
@@ -200,20 +186,74 @@ fn generate(target_bytes: u64) -> Result<Generated, zip::result::ZipError> {
             rng.below(10),
         ));
     }
+    text
+}
+
+/// KUDGIVT.csv の運行 `u` のイベント 1 行を `out` に足す
+fn push_kudgivt_row(rng: &mut Rng, u: usize, out: &mut String) {
+    let (dcd, dname) = driver(u);
+    let d = day(u);
+    let (cd, name) = EVENTS[rng.below(EVENTS.len())];
+    let h = rng.below(24);
+    let m = rng.below(60);
+    let dur = 1 + rng.below(240);
+    out.push_str(&format!(
+        "{},2026/09/{d:02},{dcd},{dname},1,2026/09/{d:02} {h:02}:{m:02}:00,2026/09/{d:02} {:02}:{:02}:00,{cd},{name},{dur},{}.{}\n",
+        unko_no(u),
+        (h + dur / 60) % 24,
+        (m + dur) % 60,
+        rng.below(120),
+        rng.below(10),
+    ));
+}
+
+type Writer = zip::ZipWriter<Counting>;
+
+/// ZipWriter と、書いた ZIP の大きさ・KUDGURI.csv (書き込み済み) を用意する
+fn start(
+    target_bytes: u64,
+    rng: &mut Rng,
+) -> Result<(Writer, Rc<Cell<u64>>, FileCount), zip::result::ZipError> {
+    let len = Rc::new(Cell::new(0));
+    let mut zw = zip::ZipWriter::new(Counting {
+        inner: Cursor::new(Vec::with_capacity(target_bytes as usize + 64 * 1024)),
+        len: len.clone(),
+    });
+    let text = kudguri_text(rng);
     let bytes = sjis(&text);
-    kudguri.csv_bytes = bytes.len();
     drop(text);
-    zw.start_file("KUDGURI.csv", opts)?;
+    let kudguri = FileCount {
+        csv_bytes: bytes.len(),
+        rows: UNKO_COUNT,
+        groups: UNKO_COUNT,
+    };
+    zw.start_file("KUDGURI.csv", opts())?;
     zw.write_all(&bytes)?;
-    drop(bytes);
+    Ok((zw, len, kudguri))
+}
+
+fn opts() -> zip::write::SimpleFileOptions {
+    zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated)
+}
+
+/// KUDGIVT.csv を始めてヘッダーを書く
+fn start_kudgivt(zw: &mut Writer, kudgivt: &mut FileCount) -> Result<(), zip::result::ZipError> {
+    zw.start_file("KUDGIVT.csv", opts())?;
+    let header = sjis(&format!("{KUDGIVT_HEADER}\n"));
+    zw.write_all(&header)?;
+    kudgivt.csv_bytes += header.len();
+    Ok(())
+}
+
+/// KUDGIVT は運行が混ざった順 (運行NO をランダムに選んで 1 行ずつ)。ZIP が target_bytes に届くまで足す
+fn generate(target_bytes: u64) -> Result<Generated, zip::result::ZipError> {
+    let mut rng = Rng(SEED);
+    let (mut zw, len, kudguri) = start(target_bytes, &mut rng)?;
 
     // KUDGIVT: ZIP が target_bytes に届くまでイベントを足す (64 KiB ずつ SJIS にして書く)
     let mut kudgivt = FileCount::default();
     let mut seen = vec![false; UNKO_COUNT];
-    zw.start_file("KUDGIVT.csv", opts)?;
-    let header = sjis(&format!("{KUDGIVT_HEADER}\n"));
-    zw.write_all(&header)?;
-    kudgivt.csv_bytes += header.len();
+    start_kudgivt(&mut zw, &mut kudgivt)?;
     let mut chunk = String::with_capacity(80 * 1024);
     while len.get() < target_bytes {
         chunk.clear();
@@ -223,26 +263,66 @@ fn generate(target_bytes: u64) -> Result<Generated, zip::result::ZipError> {
                 seen[u] = true;
                 kudgivt.groups += 1;
             }
-            let (dcd, dname) = driver(u);
-            let d = day(u);
-            let (cd, name) = EVENTS[rng.below(EVENTS.len())];
-            let h = rng.below(24);
-            let m = rng.below(60);
-            let dur = 1 + rng.below(240);
-            chunk.push_str(&format!(
-                "{},2026/09/{d:02},{dcd},{dname},1,2026/09/{d:02} {h:02}:{m:02}:00,2026/09/{d:02} {:02}:{:02}:00,{cd},{name},{dur},{}.{}\n",
-                unko_no(u),
-                (h + dur / 60) % 24,
-                (m + dur) % 60,
-                rng.below(120),
-                rng.below(10),
-            ));
+            push_kudgivt_row(&mut rng, u, &mut chunk);
             kudgivt.rows += 1;
         }
         let bytes = sjis(&chunk);
         zw.write_all(&bytes)?;
         kudgivt.csv_bytes += bytes.len();
     }
+    let zip = zw.finish()?.inner.into_inner();
+    Ok(Generated {
+        zip,
+        kudguri,
+        kudgivt,
+    })
+}
+
+/// `mode=flush` 用 (wasm32-unknown-unknown だけ): KUDGIVT を運行NO 順に、運行ごとに行を連続させて書く
+/// (rust-alc-api の fixture と同じ並び)。運行ごとの行数は、残りの ZIP の大きさと
+/// ここまでの圧縮率から毎回見積もり、ZIP がおよそ target_bytes になるようにする。
+#[cfg(not(target_os = "emscripten"))]
+pub fn generate_sorted(target_bytes: u64) -> Result<Generated, zip::result::ZipError> {
+    let mut rng = Rng(SEED);
+    let (mut zw, len, kudguri) = start(target_bytes, &mut rng)?;
+
+    let mut kudgivt = FileCount {
+        groups: UNKO_COUNT,
+        ..FileCount::default()
+    };
+    start_kudgivt(&mut zw, &mut kudgivt)?;
+    // 圧縮率 (CSV のバイト数 / ZIP のバイト数) の初期値。deflate は出力を溜めるので、ZIP が 256 KiB を超えてから実測に切り替える
+    let mut ratio = 5.0_f64;
+    let mut chunk = String::with_capacity(80 * 1024);
+    let mut sjis_total = 0u64;
+    for u in 0..UNKO_COUNT {
+        if len.get() > 256 * 1024 {
+            ratio = sjis_total as f64 / len.get() as f64;
+        }
+        let remaining = target_bytes.saturating_sub(len.get()) as f64 * ratio;
+        // chunk は UTF-8 (SJIS より約 1.3 倍)。運行ごとに最低 1 行
+        let goal = (remaining / (UNKO_COUNT - u) as f64 * 1.3) as usize;
+        let mut written = 0usize;
+        loop {
+            let before = chunk.len();
+            push_kudgivt_row(&mut rng, u, &mut chunk);
+            written += chunk.len() - before;
+            kudgivt.rows += 1;
+            if chunk.len() >= 64 * 1024 {
+                let bytes = sjis(&chunk);
+                zw.write_all(&bytes)?;
+                kudgivt.csv_bytes += bytes.len();
+                sjis_total += bytes.len() as u64;
+                chunk.clear();
+            }
+            if written >= goal {
+                break;
+            }
+        }
+    }
+    let bytes = sjis(&chunk);
+    zw.write_all(&bytes)?;
+    kudgivt.csv_bytes += bytes.len();
     let zip = zw.finish()?.inner.into_inner();
     Ok(Generated {
         zip,

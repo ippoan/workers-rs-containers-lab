@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-// probe-unknown / probe-emscripten の /zip?mb=N&mode=stream|copy・/sign・/pdf を各 n 回 (既定 10) 叩き、
-// p50 を両ターゲット並べて出す。
+// probe-unknown / probe-emscripten の /zip?mb=N&mode=flush|stream|copy・/sign・/pdf を各 n 回 (既定 10) 叩き、
+// p50 を両ターゲット並べて出す。mode=flush (運行ごとに R2 へ書き出して捨てる版) は probe-unknown だけ
+// (emscripten の列は "-")。
 // URL と Cloudflare Access の service token は env から受ける (repo に値を書かない):
 //
 //   PROBE_UNKNOWN_URL=https://<probe-unknown の staging> \
@@ -15,8 +16,8 @@
 //             worker が返す *_ms は staging ではほぼ 0 になる。CPU の重さはこの列と dashboard の CPU 時間で見る
 //   worker    worker が返した処理時間の p50 (/zip は process.total_ms、/sign は jwt の sign_ms、/pdf は Server-Timing の total)
 //   mem       線形メモリ (after) の最大 / ヒープの最大 (heap_peak) の最大。線形メモリは縮まないので isolate ごとの
-//             高水位で、同じ isolate で先に叩いた処理のピークに隠れる。そのため /zip は mb ごとに stream を先、
-//             copy を後に叩き、copy と stream の比較は heap_peak (worker のアロケータが数えた、処理中に同時に
+//             高水位で、同じ isolate で先に叩いた処理のピークに隠れる。そのため /zip は mb ごとに flush → stream →
+//             copy の順 (軽い順) に叩き、mode どうしの比較は heap_peak (worker のアロケータが数えた、処理中に同時に
 //             生きていた確保の最大。isolate の前の処理に左右されない) で見る
 //   ok        200 かつ中身が期待どおり (/zip は match、/sign は各方式の ok) だった回数 / n。
 //             失敗は status ごとに数える (メモリ超過は 500 系 / 接続断になる)
@@ -112,6 +113,13 @@ async function once(base, path) {
     out.ok = res.status === 200 && body.match === true;
     out.worker = body.process?.total_ms;
     out.extra = { zip_bytes: body.input?.zip_bytes, gen_ms: body.input?.gen_ms };
+    if (body.puts) {
+      // mode=flush: PUT の件数・総バイト数・完了待ち、後始末で消した数
+      out.extra.puts = body.puts.count;
+      out.extra.put_bytes = body.puts.bytes;
+      out.extra.put_wait_ms = body.process?.put_wait_ms;
+      out.extra.deleted = body.cleanup?.deleted;
+    }
   } else if (path === "/sign") {
     const methods = ["jwt_ring", "jwt_rsa", "aes_gcm_ring"];
     out.ok = res.status === 200 && methods.every((m) => body[m]?.ok === true || body[m]?.unsupported);
@@ -148,11 +156,18 @@ async function run(base, path) {
   };
 }
 
-const paths = [...mbs.flatMap((m) => [`/zip?mb=${m}&mode=stream`, `/zip?mb=${m}&mode=copy`]), "/sign", "/pdf"];
+const paths = [
+  ...mbs.flatMap((m) => [`/zip?mb=${m}&mode=flush`, `/zip?mb=${m}&mode=stream`, `/zip?mb=${m}&mode=copy`]),
+  "/sign",
+  "/pdf",
+];
 const results = {};
 for (const [name, base] of targets) {
   results[name] = {};
-  for (const p of paths) results[name][p] = await run(base, p);
+  for (const p of paths) {
+    if (name !== "unknown" && p.endsWith("mode=flush")) continue;
+    results[name][p] = await run(base, p);
+  }
 }
 
 if (asJson) {
@@ -176,5 +191,9 @@ if (asJson) {
     const colos = [...new Set(Object.values(results[t]).flatMap((r) => r.colos))];
     const sign = results[t]["/sign"];
     console.log(`${t}: worker colo=${colos.join(",") || "?"} / sign 暖機=${JSON.stringify(sign.warmup)}`);
+  }
+  for (const p of paths.filter((p) => p.endsWith("mode=flush"))) {
+    const r = results.unknown?.[p];
+    if (r?.extra) console.log(`unknown ${p}: ${JSON.stringify(r.extra)}`);
   }
 }

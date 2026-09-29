@@ -48,7 +48,7 @@ struct Unsupported<'a> {
     unsupported: &'a str,
 }
 
-fn error_json(error: &str, status: u16) -> Result<Response> {
+pub fn error_json(error: &str, status: u16) -> Result<Response> {
     Ok(Response::from_json(&ErrorBody {
         target: TARGET,
         error,
@@ -56,7 +56,7 @@ fn error_json(error: &str, status: u16) -> Result<Response> {
     .with_status(status))
 }
 
-fn json<T: Serialize>(req: &Request, body: T) -> Result<Response> {
+pub fn json<T: Serialize>(req: &Request, body: T) -> Result<Response> {
     Response::from_json(&Report {
         target: TARGET,
         colo: colo(req),
@@ -69,7 +69,7 @@ fn colo(req: &Request) -> Option<String> {
 }
 
 /// クエリの値 (url crate で解くと idna の表を bundle に引き込むので、文字列で見る)
-fn query(req: &Request, key: &str) -> Option<String> {
+pub fn query(req: &Request, key: &str) -> Option<String> {
     let url = req.inner().url();
     let (_, q) = url.split_once('?')?;
     q.split('&').find_map(|kv| {
