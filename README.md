@@ -79,8 +79,9 @@ rsa 0.9.10 / printpdf 0.8.2)。
     拠点のぶれが乗る。応答で見るのは heap_peak / 線形メモリ / 件数 (`match`・`runs`・`groups`・`puts.count`)
   - ローカル (`wrangler dev --env staging`、手元の R2) の実測: 1 MB は heap_peak 1.7 MiB、20 MB は 20.8 MiB
     (うち ZIP 本体 20.0 MiB)。どちらも `match: true`、PUT 6000 件
-  - R2 の bucket `lab-probe-staging` は deploy 時に無ければ wrangler が作る (4.143.0 の resource provisioning。`bucket_name`
-    を書いた binding でも、その bucket が無ければ provision する)。R2 の呼び出しも subrequest に数える
+  - R2 の bucket `lab-probe-apac` は APAC を明示して事前に `wrangler r2 bucket create <名前> --location apac` で作る
+    (deploy 時の自動作成 = 4.143.0 の resource provisioning は location を指定できず ENAM になった。無い名前のまま deploy
+    すると ENAM で自動作成される)。R2 の呼び出しも subrequest に数える
     (Workers Paid は既定 10,000/リクエスト)。1 リクエストで PUT 6000 + list / delete 各十数回
 - `GET /sign`: (a) `jwt_ring` = jsonwebtoken (ring) の RS256 (`from_rsa_pem` + `encode`、`crates/alc-notify/src/clients/lineworks.rs`)、
   (b) `jwt_rsa` = pure Rust の rsa crate の RS256、(c) `aes_gcm_ring` = ring の AES-256-GCM
@@ -255,6 +256,9 @@ LAB_URL=… CF_ACCESS_CLIENT_ID=… CF_ACCESS_CLIENT_SECRET=… node bench/measu
 # probe: /zip?mb=1,5,10,20 (flush / stream / copy)・/sign・/pdf を各 10 回 (暖機 1 回を除く) 叩き、両ターゲットの p50 を表で並べる
 PROBE_UNKNOWN_URL=https://<probe-unknown の staging> PROBE_EMSCRIPTEN_URL=https://<probe-emscripten の staging> \
   CF_ACCESS_CLIENT_ID=… CF_ACCESS_CLIENT_SECRET=… node bench/probe.mjs -n 10
+
+# 絞り込み: --only zip で /sign・/pdf を飛ばし、--modes で /zip の mode を選ぶ。--timeout <秒> (既定 900) を超えた回は表に timeout と出る
+PROBE_UNKNOWN_URL=… CF_ACCESS_CLIENT_ID=… CF_ACCESS_CLIENT_SECRET=… node bench/probe.mjs -n 1 --mb 1 --only zip --modes flush --timeout 900
 ```
 
 Access の service token は、テスト用に新しく発行しない。既存の `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` を使う。

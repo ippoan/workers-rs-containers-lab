@@ -26,8 +26,9 @@ enabled = true
 region = "aws:ap-northeast-1"
 
 # mode=flush が運行ごとの CSV を書き出す先 (リクエストの終わりに prefix ごと消す)。
-# bucket は wrangler deploy が無ければこの名前で作る (wrangler 4.143.0 の resource provisioning。
-# bucket_name を書いた R2 binding も、bucket が存在しなければ provision の対象になる)。staging だけ
+# wrangler deploy の自動作成 (4.143.0 の resource provisioning) は location を指定できず ENAM になったので、
+# APAC を明示して事前に `wrangler r2 bucket create <名前> --location apac` で作る。
+# 無い名前のまま deploy すると ENAM で自動作成される。staging だけ
 [[env.staging.r2_buckets]]
 binding = "LAB_R2"
-bucket_name = "lab-probe-staging"
+bucket_name = "lab-probe-apac"
