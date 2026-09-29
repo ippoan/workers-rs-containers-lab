@@ -147,12 +147,20 @@ jobs:
             exit 0
           fi
           url=$(cat "$RUNNER_TEMP/staging-url")
-          code=$(curl -s -o /dev/null -w '%{http_code}' "${url}/query")
-          echo "token 無しの GET <staging>/query → ${code}"
-          case "$code" in
-            302|403) ;;
-            *) echo "::error::token 無しで ${code} (Access が効いていない。直ちに止めること)"; exit 1 ;;
-          esac
+          # デプロイ直後は workers.dev のルートが行き渡るまで 404 が返る (数分後には 302)。
+          # 404 だけは 10 秒おきに最大 12 回 (約 2 分) 待つ。200 (Access が効いていない) と
+          # その他のコードは再試行せず即 fail
+          for i in $(seq 1 12); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "${url}/query")
+            echo "[${i}/12] token 無しの GET <staging>/query → ${code}"
+            case "$code" in
+              302|403) exit 0 ;;
+              404) [ "$i" -lt 12 ] && sleep 10 ;;
+              *) echo "::error::token 無しで ${code} (Access が効いていない。直ちに止めること)"; exit 1 ;;
+            esac
+          done
+          echo "::error::token 無しで 12 回とも 404 (workers.dev のルートが行き渡らない。Access の状態も dashboard で確かめること)"
+          exit 1
   # green の PR を merge する (ippoan/ci-workflows の reusable。merge は GitHub App の token で行う)。
   # deploy-staging は main への push 限定なので、PR の merge を gate しない (deploy_gate_ignore)
   auto-merge:
