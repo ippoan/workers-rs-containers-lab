@@ -1,0 +1,26 @@
+# wasm32-unknown-unknown 版の probe (GET /zip?mb=N・/sign・/pdf)。Container と DO は使わない。
+#
+# 到達経路を絞る (public repo なので、ホスト名・account_id・Access の設定はここに書かない):
+#   - トップレベル: workers_dev = false / preview_urls = false、route / routes / custom_domain を書かない
+#   - env.staging だけ workers_dev = true。その workers.dev のホスト名は Cloudflare Access で保護する
+#   scripts/check-exposure.sh が CI で毎回これを検査する。
+name = "lab-probe-unknown"
+main = "build/index.js"
+compatibility_date = "2026-09-01"
+workers_dev = false
+preview_urls = false
+
+[build]
+command = "cargo install -q worker-build@0.8.7 --locked && worker-build --release"
+
+[env.staging]
+name = "lab-probe-unknown-staging"
+workers_dev = true
+preview_urls = false
+
+[env.staging.observability]
+enabled = true
+
+# Placement Hints: DB 比較の worker と同じ置き場所 (AWS 東京リージョンの近く)。staging だけ
+[env.staging.placement]
+region = "aws:ap-northeast-1"

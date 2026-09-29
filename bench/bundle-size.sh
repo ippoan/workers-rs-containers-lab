@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# worker の wasm の raw / gzip -9 のバイト数を出す (Workers の上限 10MB は gzip 後)。
+# worker の wasm の raw / gzip -9 のバイト数を出す。Workers の上限はスクリプトの圧縮前 64 MiB
+# (圧縮後の上限は無い。ほかに起動 1 秒・メモリ 128 MB。https://developers.cloudflare.com/workers/platform/limits/)。
+# gzip は参考値として出すだけで判定しない。
 # GITHUB_STEP_SUMMARY があれば追記する。
 #
 #   bash bench/bundle-size.sh <label> <index_bg.wasm>
@@ -19,4 +21,5 @@ echo "$line"
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
   echo "$line" >>"$GITHUB_STEP_SUMMARY"
 fi
-[ "$gz" -lt 10000000 ] || { echo "::error::${label}: gzip 後 ${gz} B が 10MB を超えた"; exit 1; }
+limit=$((64 * 1024 * 1024))
+[ "$raw" -lt "$limit" ] || { echo "::error::${label}: 圧縮前 ${raw} B が 64 MiB を超えた"; exit 1; }

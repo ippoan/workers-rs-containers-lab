@@ -1,0 +1,5 @@
+# `cargo clippy --target wasm32-unknown-emscripten` を worker-build と同じ cfg で通すため
+# (worker-build 0.8.7 の TOKIO_RUSTFLAGS。experimental_tokio の export はこの cfg が無いとコンパイルできない)。
+# worker-build は RUSTFLAGS を自分で組んで渡すので、ビルドではこの値は使われない
+[target.wasm32-unknown-emscripten]
+rustflags = ["--cfg=tokio_unstable", "--cfg=wasm_bindgen_unstable_tokio"]

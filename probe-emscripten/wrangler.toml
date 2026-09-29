@@ -1,0 +1,29 @@
+# wasm32-unknown-emscripten 版の probe (GET /zip?mb=N・/sign・/pdf)。Container と DO は使わない。
+# 口と処理は probe-unknown と同じ (../probe-shared/)。ビルドできない方式は feature で外して unsupported を返す。
+#
+# 到達経路を絞る (public repo なので、ホスト名・account_id・Access の設定はここに書かない):
+#   - トップレベル: workers_dev = false / preview_urls = false、route / routes / custom_domain を書かない
+#   - env.staging だけ workers_dev = true。その workers.dev のホスト名は Cloudflare Access で保護する
+#   scripts/check-exposure.sh が CI で毎回これを検査する。
+name = "lab-probe-emscripten"
+main = "build/index.js"
+compatibility_date = "2026-09-01"
+# emscripten の glue が使う import.meta.url を出す
+compatibility_flags = ["new_module_registry"]
+workers_dev = false
+preview_urls = false
+
+[build]
+command = "cargo install -q worker-build@0.8.7 --locked && worker-build --emscripten --release"
+
+[env.staging]
+name = "lab-probe-emscripten-staging"
+workers_dev = true
+preview_urls = false
+
+[env.staging.observability]
+enabled = true
+
+# Placement Hints: DB 比較の worker と同じ置き場所 (AWS 東京リージョンの近く)。staging だけ
+[env.staging.placement]
+region = "aws:ap-northeast-1"
