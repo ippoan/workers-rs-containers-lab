@@ -47,7 +47,13 @@ bench/              bundle-size.sh / measure.mjs
   deploy する** (Access のアプリ・ポリシー・service token はこの repo に書かない)。
 - `scripts/check-exposure.sh <wrangler.toml>...` が CI で毎回これを検査し、`scripts/check-exposure-test.sh` が
   陰性対照 (wrangler.toml を崩すと exit 1) を回す。
-- CI にデプロイ job は無い。
+- **staging へのデプロイは CI (`deploy-staging`) だけ**: main への push と `workflow_dispatch` のとき、
+  `exposure` / `container` / `worker-unknown` がすべて通った後に `wrangler@4.143.0 deploy --env staging` を回す
+  (org secret `CLOUDFLARE_API_TOKEN`。account_id は書かない)。PR では走らない。
+  デプロイ直後に token 無しで `GET <staging>/query` を叩き、302 / 403 (Access が止めた) 以外なら job を落とす。
+  staging の URL は `::add-mask::` で伏せ、ログに実ホスト名を出さない。
+- 計測は CI に入れない (Access の service token は GitHub に置かない)。
+- green の PR は CI の `auto-merge` job (ippoan/ci-workflows の reusable) で自動 merge される。
 
 ## 計測
 
