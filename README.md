@@ -53,6 +53,7 @@ bench/              bundle-size.sh / measure.mjs
   デプロイ直後に token 無しで `GET <staging>/query` を叩き、302 / 403 (Access が止めた) 以外なら job を落とす。
   staging の URL は `::add-mask::` で伏せ、ログに実ホスト名を出さない。
 - 計測は CI に入れない (Access の service token は GitHub に置かない)。
+- green の PR は CI の `auto-merge` job (ippoan/ci-workflows の reusable) で自動 merge される。
 
 ## 計測
 

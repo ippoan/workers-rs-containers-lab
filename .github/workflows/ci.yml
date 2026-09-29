@@ -138,3 +138,22 @@ jobs:
             302|403) ;;
             *) echo "::error::token 無しで ${code} (Access が効いていない。直ちに止めること)"; exit 1 ;;
           esac
+
+  # green の PR を merge する (ippoan/ci-workflows の reusable。merge は GitHub App の token で行う)。
+  # deploy-staging は main への push 限定なので、PR の merge を gate しない (deploy_gate_ignore)
+  auto-merge:
+    name: Auto Merge
+    needs: [exposure, container, worker-unknown]
+    if: github.event_name == 'pull_request' && needs.exposure.result == 'success' && needs.container.result == 'success' && needs.worker-unknown.result == 'success'
+    uses: ippoan/ci-workflows/.github/workflows/auto-merge.yml@main
+    with:
+      deploy_gate_ignore: deploy-staging
+    permissions:
+      contents: write
+      pull-requests: write
+      # auto-merge.yml の job が checks: read を宣言している (全 check green の検証)。
+      # caller 側が許可しないと startup_failure になる
+      checks: read
+    secrets:
+      CI_APP_ID: ${{ secrets.CI_APP_ID }}
+      CI_APP_PRIVATE_KEY: ${{ secrets.CI_APP_PRIVATE_KEY }}
