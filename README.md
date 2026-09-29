@@ -90,6 +90,8 @@ rsa 0.9.10 / printpdf 0.8.2)。
 - `GET /pdf`: printpdf で日本語 5 行の A4 1 ページ。フォントは `crates/alc-pdf` と同じ NotoSansJP-Regular.ttf (9.6 MB、
   SIL OFL 1.1、`probe-shared/fonts/OFL.txt`) を `include_bytes!`。時間は `Server-Timing: font / render / total`、
   大きさとメモリは `x-probe-pdf-bytes` / `x-probe-memory-before` / `x-probe-memory-after`
+- `GET /_lab/panic`: わざと panic する (panic やメモリ不足で中断した後、次のリクエストが回復するかを測るため)。
+  メモリ不足の口は `/zip?mb=20&mode=copy` (heap_peak 542 MiB) を使う。staging は Access 越しにしか届かない
 - どの応答にも `target`・`colo` と、処理の区間のメモリ (`memory`。/zip は生成 `gen` と処理 `process` に分ける) を入れる:
   - `before` / `after` / `grown`: 線形メモリ (`core::arch::wasm32::memory_size`) の前・後・後 − 前。Worker の 128 MB に
     効く実物だが**伸びたら縮まない**ので、同じ isolate で先に大きい処理が走っていれば `grown` は 0 (isolate の高水位)
