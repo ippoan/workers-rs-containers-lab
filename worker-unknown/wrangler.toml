@@ -31,9 +31,14 @@ enabled = true
 [env.staging.placement]
 region = "aws:ap-northeast-1"
 
-# 2 段の移し替えの途中 (1 段目): LAB_DB の binding を一時的に外している。同じクラス名 LabDb への binding
-# (script_name = "lab-db-staging") と v2 の deleted_classes = ["LabDb"] は同時に適用できない (code 10061) ので、
-# 1 段目で binding を外して古い LabDb を消し、2 段目で binding を戻す。そのあいだ /query は 503 を返す。
+[[env.staging.durable_objects.bindings]]
+name = "LAB_DB"
+class_name = "LabDb"
+script_name = "lab-db-staging"
+
+# 2 段の移し替えは完了: 同じクラス名 LabDb への binding (script_name = "lab-db-staging") と v2 の
+# deleted_classes = ["LabDb"] は同時に適用できない (code 10061) ので、1 段目で binding を外して古い LabDb を消し
+# (v2 は適用済み)、2 段目でこの binding を戻した。
 
 # LabDb はかつてこのスクリプトにあった (v1)。lab-db-staging へ分けたので v2 で消す。LabDb は中継だけで
 # 状態を持たないので、移さず (transferred_classes にせず) lab-db-staging で新しく作り直している。
