@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// worker の GET /query を叩き、Server-Timing の connect / db と全体の往復時間を p50 / p95 で出す。
+// worker の GET /query を叩き、Server-Timing の connect / rtt / db と全体の往復時間を p50 / p95 で出す。
+// 応答の where (Worker / DO が動いている colo) も回数つきで出す。
 // URL と Cloudflare Access の service token は env から受ける (repo に値を書かない):
 //
 //   LAB_URL=https://<staging の workers.dev>/query \
@@ -60,7 +61,8 @@ async function once() {
   const json = JSON.parse(body);
   if (json.count === undefined) throw new Error("unexpected body");
   const st = parseServerTiming(res.headers.get("server-timing"));
-  return { total, connect: st.connect, db: st.db };
+  const where = json.where ? `worker=${json.where.worker ?? "?"} do=${json.where.do ?? "?"}` : undefined;
+  return { total, connect: st.connect, rtt: st.rtt, db: st.db, where };
 }
 
 function pct(xs, p) {
@@ -73,11 +75,16 @@ const samples = [];
 if (!cold) await once(); // 暖機 (Container 起動 / isolate の初回を外す)
 for (let i = 0; i < n; i++) samples.push(await once());
 
-const keys = ["total", "connect", "db"];
+const keys = ["total", "connect", "rtt", "db"];
 const summary = { mode: cold ? "cold" : "warm", n };
 for (const k of keys) {
   const xs = samples.map((s) => s[k]);
   summary[k] = { p50: pct(xs, 50), p95: pct(xs, 95) };
+}
+// where は値ごとの回数 (Worker は叩くたびに colo が変わりうる)
+summary.where = {};
+for (const s of samples) {
+  if (s.where) summary.where[s.where] = (summary.where[s.where] ?? 0) + 1;
 }
 
 if (asJson) {
@@ -88,4 +95,5 @@ if (asJson) {
   for (const k of keys) {
     console.log(`  ${k.padEnd(8)} p50=${fmt(summary[k].p50)} p95=${fmt(summary[k].p95)}`);
   }
+  for (const [w, c] of Object.entries(summary.where)) console.log(`  where    ${w} (${c})`);
 }
