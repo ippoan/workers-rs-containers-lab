@@ -80,7 +80,6 @@ bench/              bundle-size.sh / measure.mjs
 - DO の移し替え: LabDb はかつて A (`lab-unknown-staging`) にあった。中継だけで状態を持たないので、`transferred_classes`
   で移さず、`lab-db-staging` で新しく作り (migrations v1 `new_sqlite_classes`)、A 側の古い class は A の migrations v2
   (`deleted_classes`) で消す。`deleted_classes` は「ほかの Worker が旧 namespace を bind していない」ことが条件。
-  **いまは 2 段の移し替えの途中**: A は `LAB_DB` の binding を外しており、A の `/query` は 503 (`db_unavailable`) を返す。
 
 ## 公開範囲
 
