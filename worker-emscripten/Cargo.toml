@@ -1,4 +1,4 @@
-# (B) wasm32-unknown-emscripten 版の worker。(A) worker-unknown と同じ GET /query を、A の Durable Object
+# (B) wasm32-unknown-emscripten 版の worker。(A) worker-unknown と同じ GET /query を、lab-db の Durable Object
 # `LabDb` (wrangler.toml の script_name で参照) 経由で同じ Container へ流す。bundle を A と比べるので、
 # A と同じ機能だけを持たせ、依存を足さない。
 # emscripten の target・beta toolchain・下の [patch] が A に混ざらないよう、自前の Cargo.lock を持つ独立 workspace。

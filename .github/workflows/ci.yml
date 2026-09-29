@@ -1,5 +1,6 @@
 # 検査と build。main への push (と手動の workflow_dispatch) のときだけ、検査がすべて通った後に
-# staging へデプロイする (deploy-staging)。staging の workers.dev は Cloudflare Access で保護済みが前提で、
+# staging へデプロイする: まず DO と Container の lab-db (deploy-staging-db)、その後で A (deploy-staging) と
+# B (deploy-staging-emscripten) を並列に。A・B の workers.dev は Cloudflare Access で保護済みが前提で、
 # デプロイ直後に「token 無しでは Access に止められる」ことを確かめる。README 参照。
 name: CI
 
@@ -19,19 +20,21 @@ concurrency:
 
 jobs:
   # 先頭の check-exposure.sh は「外から素で届かない」(トップレベルは workers_dev / preview_urls = false、
-  # route / routes 無し。workers_dev = true は Cloudflare Access で守る env.staging だけ) の検査。
-  # check-exposure-test.sh はその陰性対照 (wrangler.toml を崩すと exit 1 になること)。
+  # route / routes 無し。workers_dev = true は Cloudflare Access で守る env.staging だけ。lab-db は --private で
+  # env.staging も含めてどこも false) の検査。check-exposure-test.sh はその陰性対照 (wrangler.toml を崩すと exit 1 になること)。
   exposure:
     name: check-exposure (wrangler.toml)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: 外から直接届かないことの検査
-        run: bash scripts/check-exposure.sh worker-unknown/wrangler.toml worker-emscripten/wrangler.toml
+        run: bash scripts/check-exposure.sh worker-unknown/wrangler.toml worker-emscripten/wrangler.toml --private lab-db/wrangler.toml
       - name: check-exposure.sh の陰性対照
         run: bash scripts/check-exposure-test.sh worker-unknown/wrangler.toml
       - name: check-exposure.sh の陰性対照 (worker-emscripten)
         run: bash scripts/check-exposure-test.sh worker-emscripten/wrangler.toml
+      - name: check-exposure.sh の陰性対照 (lab-db、--private)
+        run: bash scripts/check-exposure-test.sh --private lab-db/wrangler.toml
 
   # Container (postgres + PgBouncer transaction mode) が空の DB から立ち上がり、
   # superuser ではない bench で items (1000 行) が読めること
@@ -110,13 +113,96 @@ jobs:
       - name: bundle サイズ (上限 10MB は gzip 後)
         run: bash ../bench/bundle-size.sh lab-emscripten build/index_bg.wasm
 
+  # DO LabDb と Container を持つスクリプト (A・B が script_name で参照する)
+  lab-db:
+    name: lab-db (DO + Container)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: lab-db
+    steps:
+      - uses: actions/checkout@v4
+      # 版は lab-db/rust-toolchain.toml と揃える
+      - uses: dtolnay/rust-toolchain@1.92.0
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: lab-db
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo fmt --check
+      - run: cargo clippy --target wasm32-unknown-unknown -- -D warnings
+      # worker-build の版は wrangler.toml の [build] command と Cargo.toml の worker と揃える
+      - run: cargo install -q worker-build@0.8.7 --locked
+      - run: worker-build --release
+      - name: bundle サイズ (上限 10MB は gzip 後)
+        run: bash ../bench/bundle-size.sh lab-db build/index_bg.wasm
+
+  # DO と Container (lab-db-staging) のデプロイ。A・B より先に回す (DO の版が変わったときに、A・B が新しい DO を見る)。
+  # workers_dev = false なので Access の検査は無い (公開していないことは exposure の --private が確かめる)。
+  # 伏せ方は deploy-staging と同じ (32 桁の hex と、万一出たときの workers.dev のホスト名)。
+  # 初回だけの注意: 旧 LabDb は lab-unknown-staging にあり、A の migrations v2 (deleted_classes) で消す。
+  # 消すには「ほかの Worker が旧 namespace を bind していない」ことが要るので、B の張り替えより先に A が走ると
+  # A が落ちうる (そのときは A の job を rerun する)。
+  deploy-staging-db:
+    name: deploy staging (lab-db-staging)
+    needs: [exposure, container, lab-db]
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-staging-db
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: lab-db
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # 版は lab-db/rust-toolchain.toml と揃える
+      - uses: dtolnay/rust-toolchain@1.92.0
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: lab-db
+          save-if: false
+      # wrangler.toml の [build] command と同じ版 (入っていれば [build] の cargo install は即終わる)
+      - run: cargo install -q worker-build@0.8.7 --locked
+      # Container の image は ubuntu-latest の docker で build して push する
+      - name: wrangler deploy --env staging
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          log="$RUNNER_TEMP/deploy.log"
+          status=0
+          npx -y wrangler@4.143.0 deploy --env staging >"$log" 2>&1 || status=$?
+          # 何かを出す前に mask を登録する
+          { grep -oE '[0-9A-Fa-f]{32}' "$log" || true; } | sort -u | while read -r hex; do
+            echo "::add-mask::${hex}"
+          done
+          # 無いのが正常なので、grep が何も拾わなくても (pipefail で) 落とさない
+          { grep -oE '[A-Za-z0-9.-]+\.workers\.dev' "$log" || true; } | sort -u | while read -r host; do
+            echo "::add-mask::${host}"
+          done
+          sed -E -e 's#[A-Za-z0-9.-]+\.workers\.dev#<staging>#g' -e 's#[0-9A-Fa-f]{32}#<account>#g' "$log"
+          [ "$status" = 0 ] || exit "$status"
+          # workers_dev = false なので workers.dev の URL は出ないはず (出たら公開されている)
+          if grep -qE '[A-Za-z0-9.-]+\.workers\.dev' "$log"; then
+            echo "::error::lab-db-staging に workers.dev の URL が付いた (workers_dev = false のはず。直ちに止めること)"
+            exit 1
+          fi
+
   # staging へのデプロイ (main への push と workflow_dispatch だけ。PR では走らない)。
   # account_id は書かない (CLOUDFLARE_API_TOKEN から決まる)。staging の URL は実ホスト名なので
   # ログに出さない: wrangler の出力はファイルに取り、URL を ::add-mask:: してから伏せて出す。
   # 計測は入れない (Access の service token は GitHub に置かない)。
+  # DO と Container は lab-db-staging (deploy-staging-db の後。B とは並列)。
   deploy-staging:
     name: deploy staging (lab-unknown-staging)
-    needs: [exposure, container, worker-unknown]
+    needs: [exposure, worker-unknown, deploy-staging-db]
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     concurrency:
@@ -140,8 +226,7 @@ jobs:
           save-if: false
       # wrangler.toml の [build] command と同じ版 (入っていれば [build] の cargo install は即終わる)
       - run: cargo install -q worker-build@0.8.7 --locked
-      # wrangler は DO への CONNECT と Containers に対応する版に固定する。Container の image は
-      # ubuntu-latest の docker で build して push する
+      # wrangler は DO への CONNECT に対応する版に固定する (Container は lab-db 側)
       # wrangler の出力は $RUNNER_TEMP/deploy.log に取り、伏せてから出す。ログファイルそのもの
       # (deploy.log も wrangler が書く ~/.config/.wrangler/logs/*.log も) は出さず、artifact にも上げない。
       #   - staging の URL (実ホスト名): ::add-mask:: + <staging> に置換
@@ -192,11 +277,11 @@ jobs:
           done
           echo "::error::token 無しで 12 回とも 404 (workers.dev のルートが行き渡らない。Access の状態も dashboard で確かめること)"
           exit 1
-  # (B) の staging。DO `LabDb` と Container は (A) lab-unknown-staging のものを script_name で参照するので、
-  # A のデプロイ (deploy-staging) が済んでから回す。伏せ方と Access の検査は deploy-staging と同じ。
+  # (B) の staging。DO `LabDb` と Container は lab-db-staging のものを A と同じく script_name で参照する。
+  # deploy-staging-db の後に、A (deploy-staging) と並列に回す。伏せ方と Access の検査は deploy-staging と同じ。
   deploy-staging-emscripten:
     name: deploy staging (lab-emscripten-staging)
-    needs: [exposure, worker-emscripten, deploy-staging]
+    needs: [exposure, worker-emscripten, deploy-staging-db]
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     concurrency:
@@ -266,14 +351,14 @@ jobs:
           exit 1
 
   # green の PR を merge する (ippoan/ci-workflows の reusable。merge は GitHub App の token で行う)。
-  # deploy-staging / deploy-staging-emscripten は main への push 限定なので、PR の merge を gate しない (deploy_gate_ignore)
+  # deploy-staging-db / deploy-staging / deploy-staging-emscripten は main への push 限定なので、PR の merge を gate しない (deploy_gate_ignore)
   auto-merge:
     name: Auto Merge
-    needs: [exposure, container, worker-unknown, worker-emscripten]
-    if: github.event_name == 'pull_request' && needs.exposure.result == 'success' && needs.container.result == 'success' && needs.worker-unknown.result == 'success' && needs.worker-emscripten.result == 'success'
+    needs: [exposure, container, lab-db, worker-unknown, worker-emscripten]
+    if: github.event_name == 'pull_request' && needs.exposure.result == 'success' && needs.container.result == 'success' && needs.lab-db.result == 'success' && needs.worker-unknown.result == 'success' && needs.worker-emscripten.result == 'success'
     uses: ippoan/ci-workflows/.github/workflows/auto-merge.yml@main
     with:
-      deploy_gate_ignore: deploy-staging,deploy-staging-emscripten
+      deploy_gate_ignore: deploy-staging-db,deploy-staging,deploy-staging-emscripten
     permissions:
       contents: write
       pull-requests: write

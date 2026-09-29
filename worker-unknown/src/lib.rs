@@ -12,13 +12,13 @@
 //! I/O まで止まるので、CPU 時間は dashboard で見る。
 
 mod db;
-mod lab_db;
 
 use serde::Serialize;
 use tokio_postgres::Client;
 use worker::{console_error, event, Context, Date, Env, Method, Request, Response, Result};
 
-pub use crate::lab_db::LabDb;
+// DO `LabDb` は lab-db (../lab-db、staging では lab-db-staging) のものを wrangler.toml の script_name で参照する。
+// A は DO を持たない
 
 #[derive(Serialize)]
 struct Item {

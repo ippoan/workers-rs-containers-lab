@@ -1,0 +1,49 @@
+# Durable Object `LabDb` と Container (../container: postgres + PgBouncer transaction mode) を持つスクリプト。
+# (A) lab-unknown と (B) lab-emscripten は、DO binding の script_name でこの DO を参照する。
+#
+# 外から叩く口は要らない: トップレベルも env.staging も workers_dev = false / preview_urls = false、
+# route / routes / custom_domain を書かない (scripts/check-exposure.sh が「どの env でも false」を検査する)。
+# placement は付けない (DO の位置は Worker 側の location hint `apac-ne` で決まる)。
+name = "lab-db"
+main = "build/index.js"
+compatibility_date = "2026-09-01"
+workers_dev = false
+preview_urls = false
+
+[build]
+command = "cargo install -q worker-build@0.8.7 --locked && worker-build --release"
+
+# staging: Container は最後の接続から 10 分で止まり (常時起動にしない)、ディスクは揮発なので
+# 次の起動で空の DB から作り直す (src/lab_db.rs)。
+[env.staging]
+name = "lab-db-staging"
+workers_dev = false
+preview_urls = false
+
+[env.staging.observability]
+enabled = true
+
+[[env.staging.containers]]
+class_name = "LabDb"
+image = "../container/Dockerfile"
+image_build_context = "../container"
+max_instances = 1
+instance_type = "basic"
+# 置き場所の指定が無いと北米 (iad) に置かれ、postgres の往復ごとに太平洋を越える。日本の近くに寄せる
+constraints = { regions = ["APAC"] }
+# start.sh の出力を Workers Logs に残す
+observability = { logs = { enabled = true } }
+# SSH は明示的に無効 (wrangler は省略したフィールドを API から消さないので、書いておかないと
+# 一度有効にした鍵と ssh が残り続ける)
+ssh = { enabled = false }
+authorized_keys = []
+
+[[env.staging.durable_objects.bindings]]
+name = "LAB_DB"
+class_name = "LabDb"
+
+# LabDb は中継だけで状態を持たないので、lab-unknown-staging から移さず (transferred_classes にせず) ここで新しく作る。
+# lab-unknown-staging 側の古い LabDb は、そちらの migrations の v2 (deleted_classes) で消す
+[[env.staging.migrations]]
+tag = "v1"
+new_sqlite_classes = ["LabDb"]

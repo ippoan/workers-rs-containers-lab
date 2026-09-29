@@ -1,6 +1,6 @@
 //! postgres への接続 ((A) `worker-unknown/src/db.rs` の移植)。**DB に繋ぐのはこの 1 か所だけ**で、経路は staging の Container だけ:
 //! Durable Object `LAB_DB` へ TCP (`Stub::connect`) → DO が Container の PgBouncer (6432、
-//! transaction mode) へ中継する (DO は (A) の `worker-unknown/src/lab_db.rs`)。
+//! transaction mode) へ中継する (DO は `lab-db/src/lab_db.rs`)。
 //!
 //! `Socket` は JS の値なので、この関数は fetch handler から呼ぶ。
 
@@ -15,7 +15,7 @@ const LAB_DB_NAME: &str = "lab-db";
 /// 既にある DO は動かない。(A) と (B) は同じ名前 + 同じ hint で同じ DO を取る
 const LAB_DB_LOCATION_HINT: &str = "apac-ne";
 /// Container 内の PgBouncer のポート (container/pgbouncer.ini)
-pub const PGBOUNCER_PORT: u16 = 6432;
+const PGBOUNCER_PORT: u16 = 6432;
 
 fn lab_db(ns: &ObjectNamespace) -> Result<Stub, String> {
     ns.get_by_name_with_location_hint(LAB_DB_NAME, LAB_DB_LOCATION_HINT)

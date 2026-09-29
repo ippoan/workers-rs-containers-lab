@@ -18,7 +18,7 @@ use serde::Serialize;
 use tokio_postgres::Client;
 use worker::{console_error, event, Context, Date, Env, Method, Request, Response, Result};
 
-// DO `LabDb` は (A) の worker (lab-unknown-staging) のものを wrangler.toml の script_name で参照する。
+// DO `LabDb` は lab-db (../lab-db、staging では lab-db-staging) のものを wrangler.toml の script_name で参照する。
 // B は DO を持たない
 
 // emscripten は cdylib ではリンクできないので bin にする。handler は #[event(fetch)] が export する
