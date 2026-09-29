@@ -50,7 +50,8 @@ bench/              bundle-size.sh / measure.mjs
 - **staging へのデプロイは CI (`deploy-staging`) だけ**: main への push と `workflow_dispatch` のとき、
   `exposure` / `container` / `worker-unknown` がすべて通った後に `wrangler@4.143.0 deploy --env staging` を回す
   (org secret `CLOUDFLARE_API_TOKEN`。account_id は書かない)。PR では走らない。
-  デプロイ直後に token 無しで `GET <staging>/query` を叩き、302 / 403 (Access が止めた) 以外なら job を落とす。
+  デプロイ直後に token 無しで `GET <staging>/query` を叩き、302 / 403 (Access が止めた) 以外なら job を落とす
+  (ルートが行き渡るまでの 404 だけは 10 秒おきに最大 12 回待つ。200 などは即 fail)。
   staging の URL は `::add-mask::` で伏せ、ログに実ホスト名を出さない。
 - 計測は CI に入れない (Access の service token は GitHub に置かない)。
 - green の PR は CI の `auto-merge` job (ippoan/ci-workflows の reusable) で自動 merge される。
@@ -68,6 +69,8 @@ LAB_URL=https://<staging のホスト>/query CF_ACCESS_CLIENT_ID=… CF_ACCESS_C
 # cold: Container が 10 分の alarm で止まった後に 1 回だけ
 LAB_URL=… CF_ACCESS_CLIENT_ID=… CF_ACCESS_CLIENT_SECRET=… node bench/measure.mjs --cold
 ```
+
+Access の service token は、テスト用に新しく発行しない。既存の `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` を使う。
 
 Cloudflare 上の `Date.now` は I/O まで進まないので、Server-Timing は I/O 待ちの内訳として読む。CPU 時間は dashboard で見る。
 
