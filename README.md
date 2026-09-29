@@ -114,9 +114,9 @@ cargo clippy --target wasm32-unknown-emscripten -- -D warnings   # cfg は .carg
 worker-build --emscripten --release   # 0.8.7。初回は emsdk 6.0.10 を ~/.cache/worker-build に入れる
 ```
 
-- B の toolchain を `beta` (浮動) にしないこと: 2026-09-27 の beta (cargo 1.100) は中間生成物の置き場が変わり、
-  worker-build 0.8.7 が wasm-bindgen の snippets (`deps/snippets`) を拾えず esbuild が
-  `Could not resolve "./snippets/worker-…/inline0.js"` で落ちる。日付つきの beta に固定している。
+- beta を日付で固定している理由 (`beta-2026-09-20`): 2026-09-27 の beta (1.100.0-beta.1) で cargo の中間生成物の置き場が変わり、
+  worker-build 0.8.7 の `step_collect_emscripten_output` が `deps/snippets` を見つけられない (workers-rs main b57ba6e でも未修正)。
+  浮動の `beta` だと esbuild が `Could not resolve "./snippets/worker-…/inline0.js"` で落ちる。CI も同じ toolchain を使う。
 - ローカルで B から A の DO へつなぐには、両方を build してから、`[build]` を外した 2 つの wrangler.toml のコピーを
   並べて `wrangler dev -c … -c … --env staging` にする (`[build]` はリポジトリの root で走って落ちるため)。
   B の TCP は A の DO まで届くが、Container の起動はローカルでは A と同じく失敗する。
