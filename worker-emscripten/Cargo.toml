@@ -1,0 +1,37 @@
+# (B) wasm32-unknown-emscripten 版の worker。(A) worker-unknown と同じ GET /query を、A の Durable Object
+# `LabDb` (wrangler.toml の script_name で参照) 経由で同じ Container へ流す。bundle を A と比べるので、
+# A と同じ機能だけを持たせ、依存を足さない。
+# emscripten の target・beta toolchain・下の [patch] が A に混ざらないよう、自前の Cargo.lock を持つ独立 workspace。
+[package]
+name = "lab-emscripten"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# emscripten は cdylib ではリンクできないので bin (src/main.rs の空の main)
+
+[workspace]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# emscripten の getrandom は getentropy を使うので、A の `js` feature は要らない
+tokio-postgres = { version = "0.7", default-features = false }
+wasm-bindgen-futures = "0.4"
+# worker-build (CI と wrangler.toml の [build]) と同じ 0.8.7 に固定する
+worker = { version = "=0.8.7", features = ["experimental_tokio"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+# emscripten では unwind が未対応
+panic = "abort"
+
+# workers-rs の examples/emscripten-* と同じ patchset (tokio / mio の emscripten 対応は upstream の PR 待ち)
+[patch."https://github.com/guybedford/libc"]
+libc = { git = "https://github.com/rust-lang/libc", branch = "libc-0.2" }
+[patch.crates-io]
+libc = { git = "https://github.com/rust-lang/libc", branch = "libc-0.2" }
+tokio = { git = "https://github.com/guybedford/tokio", tag = "1.53.1-cf.emscripten" }
+tokio-macros = { git = "https://github.com/guybedford/tokio", tag = "1.53.1-cf.emscripten" }
+mio = { git = "https://github.com/guybedford/mio", tag = "1.2.3-cf.emscripten" }

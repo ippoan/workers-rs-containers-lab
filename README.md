@@ -18,7 +18,19 @@ Worker → Durable Object → Cloudflare Containers の PgBouncer (transaction m
 | worker | ターゲット | 状態 |
 |---|---|---|
 | `worker-unknown/` | `wasm32-unknown-unknown` (worker-build 0.8.7) | あり |
-| `worker-emscripten/` | `wasm32-unknown-emscripten` | 後続 |
+| `worker-emscripten/` | `wasm32-unknown-emscripten` (worker-build 0.8.7 `--emscripten`、`experimental_tokio`) | あり (B-socket: A の DO へ `Stub::connect`) |
+
+### 比較
+
+staging (Access 越し) の実測。warm は p50、単位は ms。B の staging の値は計測後に埋める。
+
+| worker | wasm raw (B) | wasm gzip (B) | warm total | connect | rtt | db | cold total |
+|---|---|---|---|---|---|---|---|
+| A `worker-unknown` | 608,873 | 242,904 | 144 | 22 | 14 | 83 | 2,000 (connect 1,750) |
+| B `worker-emscripten` | 515,221 | 226,943 | | | | | |
+
+- A の where は Worker=KIX / DO=NRT。B は A と同じ DO・Container を使う
+- B の bundle は wasm のほかに emscripten の JS glue (`build/index.js`、約 47 KB) を持つ
 
 ## 構成
 
@@ -29,6 +41,9 @@ worker-unknown/     独立 Cargo workspace (toolchain 1.92.0)
   src/lib.rs        GET /query だけ。それ以外は 404
   src/db.rs         DO LAB_DB へ Stub::connect → tokio-postgres の handshake (user bench / db postgres)
   src/lab_db.rs     DO LabDb: Container の getTcpPort(6432) へ TCP を中継。最後の接続から 10 分で Container を止める
+worker-emscripten/  独立 Cargo workspace (toolchain beta-2026-09-20、target wasm32-unknown-emscripten)
+  src/main.rs       A の src/lib.rs の移植 (bin。空の fn main)
+  src/db.rs         A の src/db.rs の移植。DO は持たず、wrangler.toml の script_name で A の LabDb を参照する
 scripts/            check-exposure.sh (wrangler.toml の公開範囲の検査) と陰性対照
 bench/              bundle-size.sh / measure.mjs
 ```
@@ -57,6 +72,8 @@ bench/              bundle-size.sh / measure.mjs
   デプロイ直後に token 無しで `GET <staging>/query` を叩き、302 / 403 (Access が止めた) 以外なら job を落とす
   (ルートが行き渡るまでの 404 だけは 10 秒おきに最大 12 回待つ。200 などは即 fail)。
   staging の URL は `::add-mask::` で伏せ、ログに実ホスト名を出さない。
+  B (`lab-emscripten-staging`) は A の DO を参照するので、`deploy-staging-emscripten` が `deploy-staging` の後に
+  同じ手順 (伏せ方・Access の検査) で回る。
 - 計測は CI に入れない (Access の service token は GitHub に置かない)。
 - green の PR は CI の `auto-merge` job (ippoan/ci-workflows の reusable) で自動 merge される。
 
@@ -65,6 +82,7 @@ bench/              bundle-size.sh / measure.mjs
 ```bash
 # bundle サイズ (worker-build --release の後)
 bash bench/bundle-size.sh lab-unknown worker-unknown/build/index_bg.wasm
+bash bench/bundle-size.sh lab-emscripten worker-emscripten/build/index_bg.wasm
 
 # warm: 暖機 1 回 + N 回の p50 / p95 (URL と Access の service token は env から)
 LAB_URL=https://<staging のホスト>/query CF_ACCESS_CLIENT_ID=… CF_ACCESS_CLIENT_SECRET=… \
@@ -90,4 +108,15 @@ psql "postgresql://bench@127.0.0.1:$(docker port lab-db 6432 | cut -d: -f2)/post
 cd worker-unknown
 cargo clippy --target wasm32-unknown-unknown -- -D warnings
 worker-build --release   # 0.8.7
+
+cd ../worker-emscripten
+cargo clippy --target wasm32-unknown-emscripten -- -D warnings   # cfg は .cargo/config.toml
+worker-build --emscripten --release   # 0.8.7。初回は emsdk 6.0.10 を ~/.cache/worker-build に入れる
 ```
+
+- beta を日付で固定している理由 (`beta-2026-09-20`): 2026-09-27 の beta (1.100.0-beta.1) で cargo の中間生成物の置き場が変わり、
+  worker-build 0.8.7 の `step_collect_emscripten_output` が `deps/snippets` を見つけられない (workers-rs main b57ba6e でも未修正)。
+  浮動の `beta` だと esbuild が `Could not resolve "./snippets/worker-…/inline0.js"` で落ちる。CI も同じ toolchain を使う。
+- ローカルで B から A の DO へつなぐには、両方を build してから、`[build]` を外した 2 つの wrangler.toml のコピーを
+  並べて `wrangler dev -c … -c … --env staging` にする (`[build]` はリポジトリの root で走って落ちるため)。
+  B の TCP は A の DO まで届くが、Container の起動はローカルでは A と同じく失敗する。

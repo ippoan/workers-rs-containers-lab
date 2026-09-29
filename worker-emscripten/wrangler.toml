@@ -1,0 +1,32 @@
+# (B) wasm32-unknown-emscripten 版の worker。(A) worker-unknown と同じ GET /query を、A の DO `LabDb` 経由で
+# 同じ Container へ流す (B-socket: Stub::connect で DO へ TCP)。
+#
+# 到達経路を絞る (public repo なので、ホスト名・account_id・Access の設定はここに書かない):
+#   - トップレベル: workers_dev = false / preview_urls = false、route / routes / custom_domain を書かない
+#   - env.staging だけ workers_dev = true。その workers.dev のホスト名は Cloudflare Access で保護する
+#   scripts/check-exposure.sh が CI で毎回これを検査する。
+name = "lab-emscripten"
+main = "build/index.js"
+compatibility_date = "2026-09-01"
+# emscripten の glue が使う import.meta.url を出す
+compatibility_flags = ["new_module_registry"]
+workers_dev = false
+preview_urls = false
+
+[build]
+command = "cargo install -q worker-build@0.8.7 --locked && worker-build --emscripten --release"
+
+# staging: DO と Container は (A) lab-unknown-staging のものを共有する。B は DO のクラスを持たないので
+# script_name で A の LabDb を参照する (migrations も A 側。先に A がデプロイされている前提)
+[env.staging]
+name = "lab-emscripten-staging"
+workers_dev = true
+preview_urls = false
+
+[env.staging.observability]
+enabled = true
+
+[[env.staging.durable_objects.bindings]]
+name = "LAB_DB"
+class_name = "LabDb"
+script_name = "lab-unknown-staging"
