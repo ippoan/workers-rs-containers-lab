@@ -18,18 +18,23 @@ Worker → Durable Object → Cloudflare Containers の PgBouncer (transaction m
 | worker | ターゲット | 状態 |
 |---|---|---|
 | `worker-unknown/` | `wasm32-unknown-unknown` (worker-build 0.8.7) | あり |
-| `worker-emscripten/` | `wasm32-unknown-emscripten` (worker-build 0.8.7 `--emscripten`、`experimental_tokio`) | あり (B-socket: A の DO へ `Stub::connect`) |
+| `worker-emscripten/` | `wasm32-unknown-emscripten` (worker-build 0.8.7 `--emscripten`、`experimental_tokio`) | あり (B-socket: lab-db の DO へ `Stub::connect`) |
+
+DO `LabDb` と Container は、どちらの worker にも属さない `lab-db/` (staging: `lab-db-staging`) に置き、A・B とも
+`script_name` で同じ DO・同じ Container を参照する (DO の版を変えるときは lab-db だけ先にデプロイする)。
 
 ### 比較
 
-staging (Access 越し) の実測。warm は p50、単位は ms。bundle は rtt_do と location hint を足した後の値。
+staging (Access 越し) の実測。warm は p50、単位は ms。bundle は DO を lab-db へ分けた後の値
+(A も B も DO のコードを持たないので、同じ条件で比べられる。分ける前の A は DO 込みで raw 618,048 / gzip 246,833)。
 時間の列は placement を入れる前の A の値で、placement を入れた後の A・B の値は計測後に埋める。
 
 | worker | wasm raw (B) | wasm gzip (B) | warm total | connect | rtt | rtt_do | db | cold total |
 |---|---|---|---|---|---|---|---|---|
-| A `worker-unknown` | 618,048 | 246,833 | 144 | 22 | 14 | | 83 | 2,000 (connect 1,750) |
+| A `worker-unknown` | 563,965 | 228,164 | 144 | 22 | 14 | | 83 | 2,000 (connect 1,750) |
 | B `worker-emscripten` | 518,882 | 228,323 | | | | | | |
 
+- lab-db (DO + Container、wasm32-unknown-unknown) は raw 506,540 / gzip 206,158 (比較の対象外)
 - A の where は Worker=KIX / DO=NRT。B は A と同じ DO・Container を使う
 - **Worker の拠点で往復が大きく変わる** (placement 前の実測: Worker=SIN の回は total p50 約 800 ms / rtt 80 ms、
   NRT/KIX の回は約 200 ms / rtt 11〜18 ms)。ターゲットを比べるときは拠点をそろえる
@@ -41,14 +46,17 @@ staging (Access 越し) の実測。warm は p50、単位は ms。bundle は rtt
 ```
 container/          postgres 16 + PgBouncer (6432, transaction mode, default_pool_size=4, max_prepared_statements=0)
                     起動のたびに空の DB から role bench (非 superuser) と items (1000 行) を作る
-worker-unknown/     独立 Cargo workspace (toolchain 1.92.0)
-  src/lib.rs        GET /query だけ。それ以外は 404
-  src/db.rs         DO LAB_DB へ Stub::connect → tokio-postgres の handshake (user bench / db postgres)
+lab-db/             独立 Cargo workspace (toolchain 1.92.0)。DO と Container だけを持つスクリプト (外から叩く口は無い)
+  src/lib.rs        fetch handler は 404 だけ
   src/lab_db.rs     DO LabDb: Container の getTcpPort(6432) へ TCP を中継。最後の接続から 10 分で Container を止める
                     HTTP の口は GET /where (DO の colo) と GET /rtt (DO ↔ Container の往復)
-worker-emscripten/  独立 Cargo workspace (toolchain beta-2026-09-20、target wasm32-unknown-emscripten)
+worker-unknown/     (A) 独立 Cargo workspace (toolchain 1.92.0)
+  src/lib.rs        GET /query だけ。それ以外は 404
+  src/db.rs         DO LAB_DB へ Stub::connect → tokio-postgres の handshake (user bench / db postgres)。
+                    DO は持たず、wrangler.toml の script_name で lab-db の LabDb を参照する
+worker-emscripten/  (B) 独立 Cargo workspace (toolchain beta-2026-09-20、target wasm32-unknown-emscripten)
   src/main.rs       A の src/lib.rs の移植 (bin。空の fn main)
-  src/db.rs         A の src/db.rs の移植。DO は持たず、wrangler.toml の script_name で A の LabDb を参照する
+  src/db.rs         A の src/db.rs の移植。A と同じく script_name で lab-db の LabDb を参照する
 scripts/            check-exposure.sh (wrangler.toml の公開範囲の検査) と陰性対照
 bench/              bundle-size.sh / measure.mjs
 ```
@@ -69,22 +77,32 @@ bench/              bundle-size.sh / measure.mjs
 - 置き場所: staging の Worker は `[env.staging.placement] region = "aws:ap-northeast-1"` (Placement Hints。トップレベルには書かない)。
   DO は A・B とも同じ名前 + location hint `apac-ne` で取る (`get_by_name_with_location_hint`)。hint が効くのは
   DO が最初に作られるときだけで、既にある DO は動かない。
+- DO の移し替え: LabDb はかつて A (`lab-unknown-staging`) にあった。中継だけで状態を持たないので、`transferred_classes`
+  で移さず、`lab-db-staging` で新しく作り (migrations v1 `new_sqlite_classes`)、A 側の古い class は A の migrations v2
+  (`deleted_classes`) で消す。`deleted_classes` は「ほかの Worker が旧 namespace を bind していない」ことが条件なので、
+  切り替えの main の run で A が B の張り替えより先に走ると A が落ちうる (そのときは A の job を rerun する)。
 
 ## 公開範囲
 
 - トップレベル (本番相当) は `workers_dev = false` / `preview_urls = false`、route を持たない。
-- `workers_dev = true` は `env.staging` だけ。**その workers.dev のホスト名は Cloudflare Access で保護してから
-  deploy する** (Access のアプリ・ポリシー・service token はこの repo に書かない)。
-- `scripts/check-exposure.sh <wrangler.toml>...` が CI で毎回これを検査し、`scripts/check-exposure-test.sh` が
+- `workers_dev = true` は A・B の `env.staging` だけ。**その workers.dev のホスト名は Cloudflare Access で保護してから
+  deploy する** (Access のアプリ・ポリシー・service token はこの repo に書かない)。lab-db は env.staging も含めて
+  どこも `workers_dev = false` / `preview_urls = false` (外から叩く口が無い)。
+- `scripts/check-exposure.sh <wrangler.toml>... --private lab-db/wrangler.toml` が CI で毎回これを検査し
+  (`--private` を付けたものは env.staging の true も許さない)、`scripts/check-exposure-test.sh` が
   陰性対照 (wrangler.toml を崩すと exit 1) を回す。
-- **staging へのデプロイは CI (`deploy-staging`) だけ**: main への push と `workflow_dispatch` のとき、
-  `exposure` / `container` / `worker-unknown` がすべて通った後に `wrangler@4.143.0 deploy --env staging` を回す
-  (org secret `CLOUDFLARE_API_TOKEN`。account_id は書かない)。PR では走らない。
-  デプロイ直後に token 無しで `GET <staging>/query` を叩き、302 / 403 (Access が止めた) 以外なら job を落とす
-  (ルートが行き渡るまでの 404 だけは 10 秒おきに最大 12 回待つ。200 などは即 fail)。
-  staging の URL は `::add-mask::` で伏せ、ログに実ホスト名を出さない。
-  B (`lab-emscripten-staging`) は A の DO を参照するので、`deploy-staging-emscripten` が `deploy-staging` の後に
-  同じ手順 (伏せ方・Access の検査) で回る。
+- **staging へのデプロイは CI だけ**: main への push と `workflow_dispatch` のとき、`wrangler@4.143.0 deploy --env staging` を
+  次の順で回す (org secret `CLOUDFLARE_API_TOKEN`。account_id は書かない)。PR では走らない。
+  1. `deploy-staging-db` (lab-db-staging: DO + Container): `exposure` / `container` / `lab-db` が通った後。
+     workers.dev の URL が出たら (= 公開されていたら) job を落とす
+  2. `deploy-staging` (A) と `deploy-staging-emscripten` (B) を**並列**に: それぞれ `exposure` と自分の build job、
+     `deploy-staging-db` が通った後。concurrency の group は 3 つとも別。
+     デプロイ直後に token 無しで `GET <staging>/query` を叩き、302 / 403 (Access が止めた) 以外なら job を落とす
+     (ルートが行き渡るまでの 404 だけは 10 秒おきに最大 12 回待つ。200 などは即 fail)。
+  staging の URL と 32 桁の hex は `::add-mask::` で伏せ、ログに実ホスト名を出さない。
+  DO の class を作り直す回は、A の job が 1 回落ちることがある (B の張り替え後に rerun で通る)。
+- デプロイの job は、対応する build の job と同じ rust-cache (`shared-key` = workspace 名) と emsdk のキャッシュを
+  復元するだけで保存しない (保存は main の build の job)。worker-build の `cargo install` と worker の build を省くため。
 - 計測は CI に入れない (Access の service token は GitHub に置かない)。
 - green の PR は CI の `auto-merge` job (ippoan/ci-workflows の reusable) で自動 merge される。
 
@@ -94,6 +112,7 @@ bench/              bundle-size.sh / measure.mjs
 # bundle サイズ (worker-build --release の後)
 bash bench/bundle-size.sh lab-unknown worker-unknown/build/index_bg.wasm
 bash bench/bundle-size.sh lab-emscripten worker-emscripten/build/index_bg.wasm
+bash bench/bundle-size.sh lab-db lab-db/build/index_bg.wasm
 
 # warm: 暖機 1 回 + N 回の p50 / p95 (URL と Access の service token は env から)
 LAB_URL=https://<staging のホスト>/query CF_ACCESS_CLIENT_ID=… CF_ACCESS_CLIENT_SECRET=… \
@@ -120,7 +139,11 @@ docker run -d --name lab-db -p 127.0.0.1::6432 lab-db
 psql "postgresql://bench@127.0.0.1:$(docker port lab-db 6432 | cut -d: -f2)/postgres" -Atc 'SELECT count(*) FROM items'
 
 # worker
-cd worker-unknown
+cd lab-db
+cargo clippy --target wasm32-unknown-unknown -- -D warnings
+worker-build --release   # 0.8.7
+
+cd ../worker-unknown
 cargo clippy --target wasm32-unknown-unknown -- -D warnings
 worker-build --release   # 0.8.7
 
@@ -132,6 +155,6 @@ worker-build --emscripten --release   # 0.8.7。初回は emsdk 6.0.10 を ~/.ca
 - beta を日付で固定している理由 (`beta-2026-09-20`): 2026-09-27 の beta (1.100.0-beta.1) で cargo の中間生成物の置き場が変わり、
   worker-build 0.8.7 の `step_collect_emscripten_output` が `deps/snippets` を見つけられない (workers-rs main b57ba6e でも未修正)。
   浮動の `beta` だと esbuild が `Could not resolve "./snippets/worker-…/inline0.js"` で落ちる。CI も同じ toolchain を使う。
-- ローカルで B から A の DO へつなぐには、両方を build してから、`[build]` を外した 2 つの wrangler.toml のコピーを
+- ローカルで A・B から lab-db の DO へつなぐには、build してから、`[build]` を外した wrangler.toml のコピーを
   並べて `wrangler dev -c … -c … --env staging` にする (`[build]` はリポジトリの root で走って落ちるため)。
-  B の TCP は A の DO まで届くが、Container の起動はローカルでは A と同じく失敗する。
+  Worker の TCP は DO まで届くが、Container の起動はローカルでは失敗する (分ける前の A でも同じ)。

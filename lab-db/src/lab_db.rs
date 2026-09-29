@@ -32,7 +32,8 @@ use worker::{
     Response, Result, Socket, State,
 };
 
-use crate::db::PGBOUNCER_PORT;
+/// Container 内の PgBouncer のポート (container/pgbouncer.ini)
+const PGBOUNCER_PORT: u16 = 6432;
 
 const SLEEP_AFTER_MS: u64 = 10 * 60 * 1000;
 const STARTUP_TIMEOUT_MS: u64 = 90 * 1000;

@@ -4,10 +4,12 @@
 #   - どこにも (トップレベル・env 配下とも) route / routes が無い (custom_domain も routes の中に書く)
 #   - workers_dev / preview_urls が true になってよいのは env.staging だけ
 #     (staging の workers.dev は Cloudflare Access で保護する前提。README 参照)
+#   - `--private` を前に付けた wrangler.toml は、env.staging も含めてどこでも workers_dev / preview_urls が
+#     true であってはならない (外から叩く口が要らないスクリプト。lab-db)
 #   - どの vars にも ALLOW_INSECURE_DB (DB への平文接続を許すローカル専用フラグ) が無い
 # 1 つでも違えば exit 1。CI で毎回走らせる。陰性対照は scripts/check-exposure-test.sh。
 #
-#   bash scripts/check-exposure.sh worker-unknown/wrangler.toml [worker-*/wrangler.toml ...]
+#   bash scripts/check-exposure.sh worker-unknown/wrangler.toml [worker-*/wrangler.toml ...] [--private lab-db/wrangler.toml]
 set -euo pipefail
 
 if [ "$#" -eq 0 ]; then
@@ -21,7 +23,22 @@ import tomllib
 
 failed = False
 
-for path in sys.argv[1:]:
+# (path, private) の組にする。--private はすぐ後ろの 1 つだけに掛かる
+targets = []
+args = sys.argv[1:]
+i = 0
+while i < len(args):
+    if args[i] == "--private":
+        if i + 1 >= len(args):
+            print("::error::--private の後に wrangler.toml が無い")
+            sys.exit(2)
+        targets.append((args[i + 1], True))
+        i += 2
+    else:
+        targets.append((args[i], False))
+        i += 1
+
+for path, private in targets:
     with open(path, "rb") as f:
         cfg = tomllib.load(f)
 
@@ -47,8 +64,11 @@ for path in sys.argv[1:]:
     # 公開してよいのは Access で守る env.staging だけ (workers_dev / preview_urls は env へ継承される)
     for name, e in envs.items():
         for key in ("workers_dev", "preview_urls"):
-            if e.get(key, cfg.get(key)) is True and name != "staging":
-                err(f"env.{name} の {key} が true (公開してよいのは Access で守る env.staging だけ)")
+            if e.get(key, cfg.get(key)) is True and (private or name != "staging"):
+                if private:
+                    err(f"env.{name} の {key} が true (--private のスクリプトはどの env も公開しない)")
+                else:
+                    err(f"env.{name} の {key} が true (公開してよいのは Access で守る env.staging だけ)")
 
     # 平文の DB 接続を許すフラグはローカル (wrangler dev --var / .dev.vars) にだけ置く
     for scope, table in scopes:
@@ -58,7 +78,10 @@ for path in sys.argv[1:]:
     if errors:
         failed = True
     else:
-        print(f"OK: {path} はトップレベルが workers_dev / preview_urls = false・route 無しで、公開する env は staging だけ")
+        if private:
+            print(f"OK: {path} はどの env も workers_dev / preview_urls = false・route 無し (--private)")
+        else:
+            print(f"OK: {path} はトップレベルが workers_dev / preview_urls = false・route 無しで、公開する env は staging だけ")
 
 sys.exit(1 if failed else 0)
 PY

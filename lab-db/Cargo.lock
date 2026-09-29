@@ -404,11 +404,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "lab-unknown"
+name = "lab-db"
 version = "0.1.0"
 dependencies = [
- "serde",
+ "futures-util",
+ "tokio",
  "tokio-postgres",
+ "wasm-bindgen",
  "wasm-bindgen-futures",
  "worker",
 ]

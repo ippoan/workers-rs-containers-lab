@@ -1,4 +1,4 @@
-# (B) wasm32-unknown-emscripten 版の worker。(A) worker-unknown と同じ GET /query を、A の DO `LabDb` 経由で
+# (B) wasm32-unknown-emscripten 版の worker。(A) worker-unknown と同じ GET /query を、lab-db の DO `LabDb` 経由で
 # 同じ Container へ流す (B-socket: Stub::connect で DO へ TCP)。
 #
 # 到達経路を絞る (public repo なので、ホスト名・account_id・Access の設定はここに書かない):
@@ -16,8 +16,8 @@ preview_urls = false
 [build]
 command = "cargo install -q worker-build@0.8.7 --locked && worker-build --emscripten --release"
 
-# staging: DO と Container は (A) lab-unknown-staging のものを共有する。B は DO のクラスを持たないので
-# script_name で A の LabDb を参照する (migrations も A 側。先に A がデプロイされている前提)
+# staging: DO と Container は ../lab-db (lab-db-staging) のものを A と共有する。B は DO のクラスを持たないので
+# script_name で LabDb を参照する (migrations も lab-db 側。先に lab-db-staging がデプロイされている前提)
 [env.staging]
 name = "lab-emscripten-staging"
 workers_dev = true
@@ -34,4 +34,4 @@ region = "aws:ap-northeast-1"
 [[env.staging.durable_objects.bindings]]
 name = "LAB_DB"
 class_name = "LabDb"
-script_name = "lab-unknown-staging"
+script_name = "lab-db-staging"
