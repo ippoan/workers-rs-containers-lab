@@ -1,0 +1,4 @@
+# build context は container/。Dockerfile が COPY するものだけを通す。
+*
+!pgbouncer.ini
+!start.sh

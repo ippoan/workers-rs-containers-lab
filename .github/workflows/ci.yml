@@ -1,0 +1,77 @@
+# 検査と build だけ。デプロイ job は持たない (staging の workers.dev は Cloudflare Access を
+# 先に設定してから手で deploy する。README 参照)。
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # 先頭の check-exposure.sh は「外から素で届かない」(トップレベルは workers_dev / preview_urls = false、
+  # route / routes 無し。workers_dev = true は Cloudflare Access で守る env.staging だけ) の検査。
+  # check-exposure-test.sh はその陰性対照 (wrangler.toml を崩すと exit 1 になること)。
+  exposure:
+    name: check-exposure (wrangler.toml)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 外から直接届かないことの検査
+        run: bash scripts/check-exposure.sh worker-unknown/wrangler.toml
+      - name: check-exposure.sh の陰性対照
+        run: bash scripts/check-exposure-test.sh worker-unknown/wrangler.toml
+
+  # Container (postgres + PgBouncer transaction mode) が空の DB から立ち上がり、
+  # superuser ではない bench で items (1000 行) が読めること
+  container:
+    name: container (PgBouncer + postgres)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: image が起動し bench で items が 1000 行見える
+        run: |
+          docker build -q -t lab-db container
+          docker run -d --name lab-db -p 127.0.0.1::6432 lab-db
+          port=$(docker port lab-db 6432 | head -1 | cut -d: -f2)
+          url="postgresql://bench@127.0.0.1:${port}/postgres"
+          for _ in $(seq 1 60); do
+            if psql "$url" -Atc 'SELECT 1' >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          docker logs lab-db 2>&1 | grep '^\[lab-db'
+          n=$(psql "$url" -Atc 'SELECT count(*) FROM items')
+          echo "items = ${n}"
+          [ "$n" = 1000 ] || { docker logs lab-db; exit 1; }
+
+  # (A) wasm32-unknown-unknown 版
+  worker-unknown:
+    name: worker-unknown (wasm32-unknown-unknown)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: worker-unknown
+    steps:
+      - uses: actions/checkout@v4
+      # 版は worker-unknown/rust-toolchain.toml と揃える
+      - uses: dtolnay/rust-toolchain@1.92.0
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: worker-unknown
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo fmt --check
+      - run: cargo clippy --target wasm32-unknown-unknown -- -D warnings
+      # worker-build の版は wrangler.toml の [build] command と Cargo.toml の worker と揃える
+      - run: cargo install -q worker-build@0.8.7 --locked
+      - run: worker-build --release
+      - name: bundle サイズ (上限 10MB は gzip 後)
+        run: bash ../bench/bundle-size.sh lab-unknown build/index_bg.wasm
