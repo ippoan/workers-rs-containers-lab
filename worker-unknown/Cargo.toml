@@ -1,0 +1,29 @@
+# (A) wasm32-unknown-unknown 版の worker。GET /query で Durable Object `LabDb` 経由で
+# Container の PgBouncer (transaction mode) へ繋ぎ、1 トランザクションを流して JSON を返す。
+# 後続の emscripten 版と混ざらないよう、自前の Cargo.lock を持つ独立 workspace にしている。
+[package]
+name = "lab-unknown"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[workspace]
+
+[dependencies]
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+# LabDb の TCP 中継 (copy_bidirectional)
+tokio = { version = "1", default-features = false, features = ["io-util"] }
+tokio-postgres = { version = "0.7", default-features = false, features = ["js"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+# worker-build (CI と wrangler.toml の [build]) と同じ 0.8.7 に固定する
+worker = "=0.8.7"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1

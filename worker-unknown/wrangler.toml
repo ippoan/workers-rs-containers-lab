@@ -1,0 +1,51 @@
+# (A) wasm32-unknown-unknown 版の worker。
+#
+# 到達経路を絞る (public repo なので、ホスト名・account_id・Access の設定はここに書かない):
+#   - トップレベル: workers_dev = false / preview_urls = false、route / routes / custom_domain を書かない
+#   - env.staging だけ workers_dev = true。その workers.dev のホスト名は Cloudflare Access で保護する
+#     (アプリ・ポリシー・service token は Access 側で管理する。Access を通らないリクエストは Worker に届かない)
+#   scripts/check-exposure.sh が CI で毎回これを検査する。
+name = "lab-unknown"
+main = "build/index.js"
+compatibility_date = "2026-09-01"
+workers_dev = false
+preview_urls = false
+
+[build]
+command = "cargo install -q worker-build@0.8.7 --locked && worker-build --release"
+
+# staging: DB は Cloudflare Containers (postgres + PgBouncer transaction mode、../container/) を
+# 抱える Durable Object LabDb。Worker → LabDb へ TCP → Container の 6432 へ中継 (src/lab_db.rs)。
+# Container は最後の接続から 10 分で止まり (常時起動にしない)、ディスクは揮発なので
+# 次の起動で空の DB から作り直す。
+#   wrangler deploy --env staging   (Access の設定が先)
+[env.staging]
+name = "lab-unknown-staging"
+workers_dev = true
+preview_urls = false
+
+[env.staging.observability]
+enabled = true
+
+[[env.staging.containers]]
+class_name = "LabDb"
+image = "../container/Dockerfile"
+image_build_context = "../container"
+max_instances = 1
+instance_type = "basic"
+# 置き場所の指定が無いと北米 (iad) に置かれ、postgres の往復ごとに太平洋を越える。日本の近くに寄せる
+constraints = { regions = ["APAC"] }
+# start.sh の出力を Workers Logs に残す
+observability = { logs = { enabled = true } }
+# SSH は明示的に無効 (wrangler は省略したフィールドを API から消さないので、書いておかないと
+# 一度有効にした鍵と ssh が残り続ける)
+ssh = { enabled = false }
+authorized_keys = []
+
+[[env.staging.durable_objects.bindings]]
+name = "LAB_DB"
+class_name = "LabDb"
+
+[[env.staging.migrations]]
+tag = "v1"
+new_sqlite_classes = ["LabDb"]
