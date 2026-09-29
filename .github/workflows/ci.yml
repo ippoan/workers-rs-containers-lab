@@ -89,7 +89,7 @@ jobs:
       # worker-build の版は wrangler.toml の [build] command と Cargo.toml の worker と揃える
       - run: cargo install -q worker-build@0.8.7 --locked
       - run: worker-build --release
-      - name: bundle サイズ (上限 10MB は gzip 後)
+      - name: bundle サイズ (上限は圧縮前 64 MiB)
         run: bash ../bench/bundle-size.sh lab-unknown build/index_bg.wasm
 
   # (B) wasm32-unknown-emscripten 版。toolchain は worker-emscripten/rust-toolchain.toml (日付つきの beta) を読む
@@ -120,11 +120,11 @@ jobs:
       # worker-build の版は wrangler.toml の [build] command と Cargo.toml の worker と揃える
       - run: cargo install -q worker-build@0.8.7 --locked
       - run: worker-build --emscripten --release
-      - name: bundle サイズ (上限 10MB は gzip 後)
+      - name: bundle サイズ (上限は圧縮前 64 MiB)
         run: bash ../bench/bundle-size.sh lab-emscripten build/index_bg.wasm
 
   # probe (wasm32-unknown-unknown)。/zip・/sign・/pdf。ring の C は ubuntu-latest の clang で wasm32 向けにコンパイルされる。
-  # PDF のフォント (9.6 MB) を同梱するので、gzip 後は上限 10MB の近く (bundle-size.sh が超えたら落とす)
+  # PDF のフォント (9.6 MB) を同梱するので raw は約 18 MB (上限は圧縮前 64 MiB。bundle-size.sh が超えたら落とす)
   probe-unknown:
     name: probe-unknown (wasm32-unknown-unknown)
     runs-on: ubuntu-latest
@@ -149,7 +149,7 @@ jobs:
       # worker-build の版は wrangler.toml の [build] command と Cargo.toml の worker と揃える
       - run: cargo install -q worker-build@0.8.7 --locked
       - run: worker-build --release
-      - name: bundle サイズ (上限 10MB は gzip 後)
+      - name: bundle サイズ (上限は圧縮前 64 MiB)
         run: bash ../bench/bundle-size.sh probe-unknown build/index_bg.wasm
 
   # probe (wasm32-unknown-emscripten)。toolchain は probe-emscripten/rust-toolchain.toml (worker-emscripten と同じ日付つきの beta)。
@@ -181,7 +181,7 @@ jobs:
       # worker-build の版は wrangler.toml の [build] command と Cargo.toml の worker と揃える
       - run: cargo install -q worker-build@0.8.7 --locked
       - run: worker-build --emscripten --release
-      - name: bundle サイズ (上限 10MB は gzip 後。JS glue も出す)
+      - name: bundle サイズ (上限は圧縮前 64 MiB。JS glue も出す)
         run: |
           bash ../bench/bundle-size.sh probe-emscripten build/index_bg.wasm
           line="probe-emscripten glue: raw=$(stat -c%s build/index.js) B / gzip=$(gzip -9c build/index.js | wc -c) B"
@@ -213,7 +213,7 @@ jobs:
       # worker-build の版は wrangler.toml の [build] command と Cargo.toml の worker と揃える
       - run: cargo install -q worker-build@0.8.7 --locked
       - run: worker-build --release
-      - name: bundle サイズ (上限 10MB は gzip 後)
+      - name: bundle サイズ (上限は圧縮前 64 MiB)
         run: bash ../bench/bundle-size.sh lab-db build/index_bg.wasm
 
   # DO と Container (lab-db-staging) のデプロイ。A・B より先に回す (DO の版が変わったときに、A・B が新しい DO を見る)。

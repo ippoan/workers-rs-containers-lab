@@ -4,6 +4,11 @@
 //! 入力の ZIP は worker の中で決定的に作る (種は固定、実データは使わない): SHIFT_JIS の KUDGURI.csv
 //! (運行ごとに 1 行) と KUDGIVT.csv (運行のイベント。ZIP が N MB になるまで足す)。
 //! 生成と処理の時間を分け、処理で数えた行数・運行NO の数が生成時の値と一致するかも返す。
+//!
+//! `?mode=copy` (既定) は rust-alc-api の 3 関数をそのまま写した版、`?mode=stream` はエントリを 1 つずつ処理して
+//! 中間物 (展開したバイト列・decode した文字列) をすぐ捨てる版。結果 (行数・運行NO の数) は同じになる。
+//! メモリは処理の区間の `memory.process.heap_peak` で比べる (線形メモリは縮まないので、同じ isolate で
+//! 先に大きい処理が走ると `grown` は 0 になる。mem.rs 参照)。
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -12,7 +17,7 @@ use std::rc::Rc;
 
 use serde::Serialize;
 
-use crate::mem::linear_memory_bytes;
+use crate::mem::{Memory, Span};
 use crate::now_ms;
 
 /// 運行NO の数 (dtako の 1 か月ぶんの ZIP の規模)
@@ -267,7 +272,7 @@ pub struct Processed {
     pub groups: usize,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 pub struct Timing {
     pub extract_ms: u64,
     pub decode_ms: u64,
@@ -275,36 +280,62 @@ pub struct Timing {
     pub total_ms: u64,
 }
 
+/// `?mode=`
+#[derive(Serialize, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    /// rust-alc-api の 3 関数をそのまま: 全エントリを Vec に展開 → 全部 decode → group (中間物を同時に持つ)
+    Copy,
+    /// エントリを 1 つずつ 展開 → decode (バイト列をすぐ drop) → group (文字列をすぐ drop)
+    Stream,
+}
+
+impl Mode {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "copy" => Some(Mode::Copy),
+            "stream" => Some(Mode::Stream),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Serialize)]
 pub struct ZipReport {
     pub mb: u32,
+    pub mode: Mode,
     pub input: Input,
     pub process: Timing,
     pub files: Vec<Processed>,
     /// 処理で数えた行数・運行NO の数が生成時の値と一致したか
     #[serde(rename = "match")]
     pub matched: bool,
-    /// before: 生成の前 / after_gen: 生成の後 (ZIP を持った状態) / after: 処理の後
     pub memory: ZipMemory,
 }
 
+/// gen: ZIP の生成の区間 / process: 処理の区間 (ZIP を持った状態から始まる。group の結果は持ったまま終わる)
 #[derive(Serialize)]
 pub struct ZipMemory {
-    pub before: usize,
-    pub after_gen: usize,
-    pub after: usize,
+    pub gen: Memory,
+    pub process: Memory,
 }
 
-pub fn run(mb: u32) -> Result<ZipReport, String> {
-    let before = linear_memory_bytes();
-    let t0 = now_ms();
-    let gen = generate(u64::from(mb) * 1024 * 1024).map_err(|e| format!("generate: {e}"))?;
-    let gen_ms = now_ms() - t0;
-    let after_gen = linear_memory_bytes();
+type Groups = HashMap<String, Vec<String>>;
 
-    // rust-alc-api と同じく、全エントリを展開 → ファイルごとに decode → group
+fn processed(name: String, csv_bytes: usize, utf8_bytes: usize, map: &Groups) -> Processed {
+    Processed {
+        name,
+        csv_bytes,
+        utf8_bytes,
+        rows: map.values().map(Vec::len).sum(),
+        groups: map.len(),
+    }
+}
+
+/// rust-alc-api と同じく、全エントリを展開 → ファイルごとに decode → group。中間物は最後まで持つ
+fn process_copy(zip: &[u8]) -> Result<(Vec<Processed>, Timing, Vec<Groups>), String> {
     let t1 = now_ms();
-    let entries = extract_zip(&gen.zip).map_err(|e| format!("extract: {e}"))?;
+    let entries = extract_zip(zip).map_err(|e| format!("extract: {e}"))?;
     let t2 = now_ms();
     let mut decoded = Vec::with_capacity(entries.len());
     for (name, bytes) in &entries {
@@ -315,18 +346,71 @@ pub fn run(mb: u32) -> Result<ZipReport, String> {
     let mut groups = Vec::with_capacity(decoded.len());
     for (name, csv_bytes, text) in &decoded {
         let map = group_csv_by_unko_no(text);
-        files.push(Processed {
-            name: name.clone(),
-            csv_bytes: *csv_bytes,
-            utf8_bytes: text.len(),
-            rows: map.values().map(Vec::len).sum(),
-            groups: map.len(),
-        });
+        files.push(processed(name.clone(), *csv_bytes, text.len(), &map));
         // 実処理は map を後段 (DB への書き込み) へ渡すので、全ファイルぶん持ったまま測る
         groups.push(map);
     }
     let t4 = now_ms();
-    let after = linear_memory_bytes();
+    let timing = Timing {
+        extract_ms: t2 - t1,
+        decode_ms: t3 - t2,
+        group_ms: t4 - t3,
+        total_ms: t4 - t1,
+    };
+    Ok((files, timing, groups))
+}
+
+/// エントリを 1 つずつ処理し、展開したバイト列は decode の直後に、decode した文字列は group の直後に捨てる
+/// (group の結果は copy と同じく全ファイルぶん持つ)
+fn process_stream(zip: &[u8]) -> Result<(Vec<Processed>, Timing, Vec<Groups>), String> {
+    let t0 = now_ms();
+    let mut timing = Timing::default();
+    let mut archive =
+        zip::ZipArchive::new(Cursor::new(zip)).map_err(|e| format!("extract: {e}"))?;
+    let mut files = Vec::with_capacity(archive.len());
+    let mut groups = Vec::with_capacity(archive.len());
+    for i in 0..archive.len() {
+        let t1 = now_ms();
+        let (name, bytes) = {
+            let mut file = archive.by_index(i).map_err(|e| format!("extract: {e}"))?;
+            let name = file.name().to_string();
+            let mut contents = Vec::with_capacity(file.size() as usize);
+            file.read_to_end(&mut contents)
+                .map_err(|e| format!("extract: {e}"))?;
+            (name, contents)
+        };
+        let t2 = now_ms();
+        let csv_bytes = bytes.len();
+        let text = decode_shift_jis(&bytes);
+        drop(bytes);
+        let t3 = now_ms();
+        let map = group_csv_by_unko_no(&text);
+        let utf8_bytes = text.len();
+        drop(text);
+        let t4 = now_ms();
+        files.push(processed(name, csv_bytes, utf8_bytes, &map));
+        groups.push(map);
+        timing.extract_ms += t2 - t1;
+        timing.decode_ms += t3 - t2;
+        timing.group_ms += t4 - t3;
+    }
+    timing.total_ms = now_ms() - t0;
+    Ok((files, timing, groups))
+}
+
+pub fn run(mb: u32, mode: Mode) -> Result<ZipReport, String> {
+    let span = Span::start();
+    let t0 = now_ms();
+    let gen = generate(u64::from(mb) * 1024 * 1024).map_err(|e| format!("generate: {e}"))?;
+    let gen_ms = now_ms() - t0;
+    let gen_mem = span.finish();
+
+    let span = Span::start();
+    let (files, process, groups) = match mode {
+        Mode::Copy => process_copy(&gen.zip)?,
+        Mode::Stream => process_stream(&gen.zip)?,
+    };
+    let process_mem = span.finish();
     drop(groups);
 
     let expect = |name: &str, c: &FileCount| {
@@ -340,24 +424,19 @@ pub fn run(mb: u32) -> Result<ZipReport, String> {
 
     Ok(ZipReport {
         mb,
+        mode,
         input: Input {
             zip_bytes: gen.zip.len(),
             gen_ms,
             kudguri: gen.kudguri,
             kudgivt: gen.kudgivt,
         },
-        process: Timing {
-            extract_ms: t2 - t1,
-            decode_ms: t3 - t2,
-            group_ms: t4 - t3,
-            total_ms: t4 - t1,
-        },
+        process,
         files,
         matched,
         memory: ZipMemory {
-            before,
-            after_gen,
-            after,
+            gen: gen_mem,
+            process: process_mem,
         },
     })
 }

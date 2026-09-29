@@ -55,8 +55,10 @@ DB とは別に、rust-alc-api (15bf45e) の「Worker に移しにくい処理�
 依存の版は rust-alc-api の Cargo.lock に揃える (zip 2.4.2 / encoding_rs 0.8.35 / jsonwebtoken 9.3.1 / ring 0.17.14 /
 rsa 0.9.10 / printpdf 0.8.2)。
 
-- `GET /zip?mb=N` (N = 1..=20): `crates/alc-csv-parser/src/lib.rs` の `extract_zip` → `decode_shift_jis` →
-  `group_csv_by_unko_no` の写し。入力の ZIP は worker の中で種を固定して作る (SHIFT_JIS の KUDGURI.csv = 運行 3000 件に
+- `GET /zip?mb=N&mode=copy|stream` (N = 1..=20、mode の既定は copy): `crates/alc-csv-parser/src/lib.rs` の `extract_zip` → `decode_shift_jis` →
+  `group_csv_by_unko_no`。`copy` は 3 関数をそのまま写した版 (全エントリを Vec に展開 → 全部 decode → group。中間物を
+  同時に持つ)、`stream` はエントリを 1 つずつ展開 → decode (展開したバイト列をすぐ捨てる) → group (decode した文字列を
+  すぐ捨てる) する版。どちらも group の結果は全ファイルぶん持ったまま測る。入力の ZIP は worker の中で種を固定して作る (SHIFT_JIS の KUDGURI.csv = 運行 3000 件に
   1 行ずつ、KUDGIVT.csv = ZIP が N MB になるまでイベント行。圧縮率は約 4.6 倍)。生成 (`input.gen_ms`) と処理
   (`process.*_ms`) を分け、処理で数えた行数・運行NO の数が生成時と一致したかを `match` で返す。
   zip は `default-features = false, features = ["deflate"]` (rust-alc-api は default = bzip2 / zstd / xz の C ライブラリ込み)
@@ -68,8 +70,13 @@ rsa 0.9.10 / printpdf 0.8.2)。
 - `GET /pdf`: printpdf で日本語 5 行の A4 1 ページ。フォントは `crates/alc-pdf` と同じ NotoSansJP-Regular.ttf (9.6 MB、
   SIL OFL 1.1、`probe-shared/fonts/OFL.txt`) を `include_bytes!`。時間は `Server-Timing: font / render / total`、
   大きさとメモリは `x-probe-pdf-bytes` / `x-probe-memory-before` / `x-probe-memory-after`
-- どの応答にも `target` と、処理の前後の wasm の線形メモリ (`memory`、`core::arch::wasm32::memory_size`) を入れる。
-  線形メモリは縮まないので、同じ isolate で先に大きい処理が走っていれば `before` から大きい (isolate の高水位として読む)
+- どの応答にも `target`・`colo` と、処理の区間のメモリ (`memory`。/zip は生成 `gen` と処理 `process` に分ける) を入れる:
+  - `before` / `after` / `grown`: 線形メモリ (`core::arch::wasm32::memory_size`) の前・後・後 − 前。Worker の 128 MB に
+    効く実物だが**伸びたら縮まない**ので、同じ isolate で先に大きい処理が走っていれば `grown` は 0 (isolate の高水位)
+  - `heap_before` / `heap_peak`: グローバルアロケータ (`probe-shared/mem.rs`) で数えた、区間の前に生きていた確保と、
+    区間中に同時に生きていた確保の最大。isolate の前の処理に左右されないので、**copy と stream の比較はこちらで見る**
+    (断片化や線形メモリの伸ばし方の分は入らないので、線形メモリより小さい)
+  - bench/probe.mjs は mb ごとに stream を先、copy を後に叩く (線形メモリの列が後の版に隠れないように)
 - **そのターゲットでビルドできない方式は feature (`ring` / `pdf`) で外し、`{"unsupported": "<理由>"}` を返す** (/pdf は 501)
 
 ### ビルドできたか
@@ -77,10 +84,10 @@ rsa 0.9.10 / printpdf 0.8.2)。
 | 方式 | unknown | emscripten |
 |---|---|---|
 | ZIP (zip deflate + encoding_rs) | ○ | ○ |
-| (a) jsonwebtoken (ring) RS256 | ○ (ring の C は clang で wasm32 へ。`wasm32_unknown_unknown_js`) | × |
+| (a) jsonwebtoken (ring) RS256 | ○ (ring の C は clang で wasm32 へ。`wasm32_unknown_unknown_js`) | ビルドできない (ring の `SystemRandom` が emscripten 未対応、E0277) |
 | (b) rsa crate RS256 | ○ | ○ |
-| (c) ring AES-256-GCM | ○ | × |
-| PDF (printpdf 0.8.2 + NotoSansJP) | ○ | × |
+| (c) ring AES-256-GCM | ○ | ビルドできない (同上。`encrypt_secret` の nonce が `SystemRandom`) |
+| PDF (printpdf 0.8.2 + NotoSansJP) | ○ | ビルドできない (printpdf の `crate-type = cdylib` を wasm-ld がリンクできない) |
 
 - emscripten の ring: C / asm は emcc でコンパイルできるが、ring 0.17.14 の `SystemRandom` の `SecureRandom` 実装は
   target_os の許可リスト (`src/rand.rs`) に emscripten を含まない。jsonwebtoken の RS256 署名と `encrypt_secret` は
@@ -96,14 +103,15 @@ worker-build 0.8.7 --release (wasm-opt 後)。gzip は `gzip -9`。
 
 | worker | features | wasm raw (B) | wasm gzip (B) | JS glue raw / gzip (B) |
 |---|---|---|---|---|
-| probe-unknown | ring + pdf (既定) | 18,300,384 | 9,686,306 | 22,295 / 5,645 |
-| probe-unknown | ring | 1,075,228 | 493,598 | |
-| probe-unknown | なし | 690,568 | 343,964 | |
-| probe-emscripten | なし (既定) | 660,137 | 350,330 | 46,121 / 16,419 |
+| probe-unknown | ring + pdf (既定) | 18,430,391 | 9,715,740 | 22,449 / 5,666 |
+| probe-unknown | ring | 1,097,670 | 496,786 | |
+| probe-unknown | なし | 705,086 | 346,697 | |
+| probe-emscripten | なし (既定) | 668,347 | 352,317 | 46,246 / 16,440 |
 
-- PDF (printpdf + フォント) だけで約 17.2 MB (raw) 増え、gzip 後でも上限 10MB の直下 (フォント以外の printpdf が
-  約 7.6 MB。既定の `html` feature の azul / kuchiki / svg2pdf などを含む)
-- ring は unknown で約 +385 KB (raw)
+- 上限はスクリプトの圧縮前 64 MiB (圧縮後の上限は無い。ほかに起動 1 秒・メモリ 128 MB)。bench/bundle-size.sh は圧縮前で判定する
+- PDF (printpdf + フォント) だけで約 17.3 MB (raw) 増える (上限は圧縮前 64 MiB なので収まる。フォント以外の printpdf が
+  約 7.7 MB。既定の `html` feature の azul / kuchiki / svg2pdf などを含む)
+- ring は unknown で約 +393 KB (raw)
 
 ### ローカルの値 (wrangler@4.143.0 dev、参考値)
 
@@ -113,16 +121,22 @@ worker-build 0.8.7 --release (wasm-opt 後)。gzip は `gzip -9`。
 |---|---|---|
 | /zip?mb=1 process total (extract / decode / group) | 38 ms (19 / 12 / 7) | 40 ms (23 / 10 / 7) |
 | /zip?mb=1 生成 | 401 ms | 395 ms |
-| /zip 線形メモリ (after、mb = 1 / 5 / 10 / 20、MiB) | 43 / 152 / 290 / 567 | 37 / 147 / 309 / 608 |
+| /zip process total (mb = 5 / 10 / 20、copy と stream でほぼ同じ) | 114 / 226 / 450 ms | 129 / 257 / 511 ms |
+| /zip heap_peak copy (mb = 1 / 5 / 10 / 20、MiB) | 30 / 137 / 272 / 542 | 30 / 137 / 272 / 542 |
+| /zip heap_peak stream (mb = 1 / 5 / 10 / 20、MiB) | 20 / 103 / 206 / 412 | 20 / 103 / 206 / 412 |
+| /zip 線形メモリ (after の最大、mb = 1 / 5 / 10 / 20、MiB) | 47 / 187 / 325 / 602 | 36 / 142 / 283 / 563 |
 | /sign keygen (2048 bit、1 回) | 260〜1,280 ms | 327〜457 ms |
 | /sign jwt_ring sign / verify | 7.7 / 0.3 ms | unsupported |
 | /sign jwt_rsa sign / verify | 5.6 / 0.7 ms | 5.6 / 0.7 ms |
 | /sign aes_gcm_ring enc / dec | ≒0 / ≒0 ms | unsupported |
-| /pdf total (font parse / render)、PDF | 36 ms (22 / 14)、18,329 B | unsupported |
+| /pdf total (font parse / render)、PDF | 36 ms (22 / 14)、18,329 B、heap_peak 22 MiB | unsupported |
 
-- ZIP は 1〜20 MB のすべてで両ターゲットとも `match: true`
-- **線形メモリは mb=5 (ZIP 5 MB、CSV 24 MB) で約 150 MB に届き、Worker の 128 MB を超える** (ZIP・展開後の SJIS・UTF-8・
-  行ごとの String を同時に持つため)。staging の値は bench/probe.mjs で取る
+- ZIP は 1〜20 MB のすべてで両ターゲット・両 mode とも `match: true` (行数・運行NO の数が一致)
+- heap_peak はターゲットによらず同じ (同じコード・同じ確保)。stream は copy より約 25% 小さいだけで、
+  **stream でも mb=5 (ZIP 5 MB、SJIS の CSV 24 MB) で約 100 MiB、線形メモリは copy で 140〜190 MiB に届き、Worker の
+  128 MB を超える見込み**。残るのは group の結果 (行ごとの `String` + `Vec`、UTF-8 の約 4 倍) と入力の ZIP で、
+  中間物を捨てるだけでは足りない (行を持たずに DB へ流す形が要る)
+- staging の値 (128 MB を超えたときの 5xx を含む) は bench/probe.mjs で取る
 
 ## 構成
 

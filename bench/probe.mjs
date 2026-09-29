@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// probe-unknown / probe-emscripten の /zip?mb=N・/sign・/pdf を各 n 回 (既定 10) 叩き、p50 を両ターゲット並べて出す。
+// probe-unknown / probe-emscripten の /zip?mb=N&mode=stream|copy・/sign・/pdf を各 n 回 (既定 10) 叩き、
+// p50 を両ターゲット並べて出す。
 // URL と Cloudflare Access の service token は env から受ける (repo に値を書かない):
 //
 //   PROBE_UNKNOWN_URL=https://<probe-unknown の staging> \
@@ -13,7 +14,10 @@
 //   wall      クライアントで測った往復 (p50)。Cloudflare 上の Date.now は I/O まで進まないので、
 //             worker が返す *_ms は staging ではほぼ 0 になる。CPU の重さはこの列と dashboard の CPU 時間で見る
 //   worker    worker が返した処理時間の p50 (/zip は process.total_ms、/sign は jwt の sign_ms、/pdf は Server-Timing の total)
-//   mem       応答の線形メモリ (after) の最大。線形メモリは縮まないので isolate ごとの高水位
+//   mem       線形メモリ (after) の最大 / ヒープの最大 (heap_peak) の最大。線形メモリは縮まないので isolate ごとの
+//             高水位で、同じ isolate で先に叩いた処理のピークに隠れる。そのため /zip は mb ごとに stream を先、
+//             copy を後に叩き、copy と stream の比較は heap_peak (worker のアロケータが数えた、処理中に同時に
+//             生きていた確保の最大。isolate の前の処理に左右されない) で見る
 //   ok        200 かつ中身が期待どおり (/zip は match、/sign は各方式の ok) だった回数 / n。
 //             失敗は status ごとに数える (メモリ超過は 500 系 / 接続断になる)
 // 各エンドポイントの先頭 1 回は暖機として捨てる (isolate の起動と、/sign の鍵生成を外す)。
@@ -84,6 +88,7 @@ async function once(base, path) {
     out.ok = res.status === 200 && buf.subarray(0, 5).toString() === "%PDF-";
     out.worker = st.total;
     out.mem = Number(res.headers.get("x-probe-memory-after")) || undefined;
+    out.heap = Number(res.headers.get("x-probe-heap-peak")) || undefined;
     out.colo = res.headers.get("x-probe-colo") ?? undefined;
     out.extra = { pdf_bytes: buf.length };
     return out;
@@ -95,7 +100,10 @@ async function once(base, path) {
     return out;
   }
   out.colo = body.colo ?? undefined;
-  out.mem = body.memory?.after;
+  // /zip は処理の区間 (memory.process)、/sign は memory
+  const mem = body.memory?.process ?? body.memory;
+  out.mem = mem?.after;
+  out.heap = mem?.heap_peak;
   if (body.unsupported) {
     out.unsupported = body.unsupported;
     return out;
@@ -129,6 +137,7 @@ async function run(base, path) {
     wall_p50: p50(xs.map((x) => x.wall)),
     worker_p50: p50(xs.map((x) => x.worker)),
     mem_max: Math.max(0, ...xs.map((x) => x.mem ?? 0)) || undefined,
+    heap_max: Math.max(0, ...xs.map((x) => x.heap ?? 0)) || undefined,
     ok: xs.filter((x) => x.ok).length,
     n,
     fails,
@@ -139,7 +148,7 @@ async function run(base, path) {
   };
 }
 
-const paths = [...mbs.map((m) => `/zip?mb=${m}`), "/sign", "/pdf"];
+const paths = [...mbs.flatMap((m) => [`/zip?mb=${m}&mode=stream`, `/zip?mb=${m}&mode=copy`]), "/sign", "/pdf"];
 const results = {};
 for (const [name, base] of targets) {
   results[name] = {};
@@ -155,10 +164,10 @@ if (asJson) {
     if (!r) return "-";
     if (r.unsupported) return "unsupported";
     const f = Object.entries(r.fails).map(([s, c]) => `${s}×${c}`).join(" ");
-    return `${ms(r.wall_p50)} / ${ms(r.worker_p50)} / ${mb(r.mem_max)} / ${r.ok}/${r.n}${f ? ` (${f})` : ""}`;
+    return `${ms(r.wall_p50)} / ${ms(r.worker_p50)} / ${mb(r.mem_max)} / ${mb(r.heap_max)} / ${r.ok}/${r.n}${f ? ` (${f})` : ""}`;
   };
   const names = ["unknown", "emscripten"];
-  console.log(`n=${n}。セルは wall p50 ms / worker p50 ms / mem 最大 / ok 数`);
+  console.log(`n=${n}。セルは wall p50 ms / worker p50 ms / 線形メモリ最大 / heap_peak 最大 / ok 数 (失敗は status×回数)`);
   console.log(`| path | ${names.join(" | ")} |`);
   console.log(`|---|${names.map(() => "---").join("|")}|`);
   for (const p of paths) console.log(`| ${p} | ${names.map((t) => cell(results[t]?.[p])).join(" | ")} |`);

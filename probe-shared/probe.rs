@@ -1,7 +1,7 @@
 //! probe-unknown / probe-emscripten の共通のルーティング。両方の crate が `#[path]` でこのディレクトリの
 //! モジュールを読むので、処理のコードはターゲット間で同じ (違うのは crate の入口と feature だけ)。
 //!
-//! - `GET /zip?mb=N` (N = 1..=20): dtako の ZIP の展開 → SHIFT_JIS の decode → 運行NO で group (JSON)
+//! - `GET /zip?mb=N[&mode=copy|stream]` (N = 1..=20): dtako の ZIP の展開 → SHIFT_JIS の decode → 運行NO で group (JSON)
 //! - `GET /sign`: RS256 (jsonwebtoken / rsa) と AES-256-GCM (ring) (JSON)
 //! - `GET /pdf`: printpdf で日本語 1 ページ (application/pdf。時間とメモリは応答ヘッダー)
 //!
@@ -68,13 +68,15 @@ fn colo(req: &Request) -> Option<String> {
     req.cf().map(|cf| cf.colo())
 }
 
-/// `?mb=N` (url crate で解くと idna の表を bundle に引き込むので、文字列で見る)
-fn query_mb(req: &Request) -> Option<u32> {
+/// クエリの値 (url crate で解くと idna の表を bundle に引き込むので、文字列で見る)
+fn query(req: &Request, key: &str) -> Option<String> {
     let url = req.inner().url();
     let (_, q) = url.split_once('?')?;
-    q.split('&')
-        .find_map(|kv| kv.strip_prefix("mb="))
-        .and_then(|v| v.parse().ok())
+    q.split('&').find_map(|kv| {
+        kv.strip_prefix(key)
+            .and_then(|rest| rest.strip_prefix('='))
+            .map(str::to_string)
+    })
 }
 
 pub fn handle(req: &Request) -> Result<Response> {
@@ -83,10 +85,18 @@ pub fn handle(req: &Request) -> Result<Response> {
     }
     match req.path().as_str() {
         "/zip" => {
-            let Some(mb) = query_mb(req).filter(|mb| (1..=MAX_MB).contains(mb)) else {
+            let Some(mb) = query(req, "mb")
+                .and_then(|v| v.parse().ok())
+                .filter(|mb| (1..=MAX_MB).contains(mb))
+            else {
                 return error_json("mb must be 1..=20", 400);
             };
-            match crate::zip_probe::run(mb) {
+            let Some(mode) =
+                crate::zip_probe::Mode::parse(query(req, "mode").as_deref().unwrap_or("copy"))
+            else {
+                return error_json("mode must be copy or stream", 400);
+            };
+            match crate::zip_probe::run(mb, mode) {
                 Ok(r) => json(req, r),
                 Err(e) => {
                     console_error!("probe: zip: {e}");
@@ -120,6 +130,7 @@ pub fn handle(req: &Request) -> Result<Response> {
                 h.set("x-probe-pdf-bytes", &r.bytes.len().to_string())?;
                 h.set("x-probe-memory-before", &r.memory.before.to_string())?;
                 h.set("x-probe-memory-after", &r.memory.after.to_string())?;
+                h.set("x-probe-heap-peak", &r.memory.heap_peak.to_string())?;
                 h.set(
                     "server-timing",
                     &format!(

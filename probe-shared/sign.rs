@@ -22,7 +22,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::Sha256;
 
-use crate::mem::{linear_memory_bytes, Memory};
+use crate::mem::{Memory, Span};
 use crate::now_ms;
 
 const BITS: usize = 2048;
@@ -311,7 +311,7 @@ pub struct SignReport {
 }
 
 pub fn run() -> Result<SignReport, String> {
-    let before = linear_memory_bytes();
+    let span = Span::start();
     let (keys, keygen_ms) = keys()?;
     // 1 つの方式が実行時に失敗しても、ほかの方式の結果は返す
     let (jwt_ring, ring_token) =
@@ -328,9 +328,6 @@ pub fn run() -> Result<SignReport, String> {
         jwt_ring,
         jwt_rsa,
         aes_gcm_ring,
-        memory: Memory {
-            before,
-            after: linear_memory_bytes(),
-        },
+        memory: span.finish(),
     })
 }

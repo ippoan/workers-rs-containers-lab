@@ -8,7 +8,7 @@ use printpdf::{
     Mm, ParsedFont, PdfDocument, PdfPage, PdfSaveOptions, Point, Pt, TextShapingOptions,
 };
 
-use crate::mem::{linear_memory_bytes, Memory};
+use crate::mem::{Memory, Span};
 use crate::now_ms;
 
 const FONT_DATA: &[u8] = include_bytes!("fonts/NotoSansJP-Regular.ttf");
@@ -30,7 +30,7 @@ pub struct PdfReport {
 }
 
 pub fn run() -> Result<PdfReport, String> {
-    let before = linear_memory_bytes();
+    let span = Span::start();
     let t0 = now_ms();
     let mut doc = PdfDocument::new("probe");
     let mut warnings = Vec::new();
@@ -57,9 +57,6 @@ pub fn run() -> Result<PdfReport, String> {
         font_parse_ms: t1 - t0,
         render_ms: t2 - t1,
         total_ms: t2 - t0,
-        memory: Memory {
-            before,
-            after: linear_memory_bytes(),
-        },
+        memory: span.finish(),
     })
 }
