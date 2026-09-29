@@ -104,6 +104,8 @@ pub fn handle(req: &Request) -> Result<Response> {
                 }
             }
         }
+        // 中断後に次のリクエストが回復するかを測るための口 (README の probe の節)
+        "/_lab/panic" => panic!("lab: intentional panic"),
         "/sign" => match crate::sign::run() {
             Ok(r) => json(req, r),
             Err(e) => {
