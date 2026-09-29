@@ -34,7 +34,11 @@ bench/              bundle-size.sh / measure.mjs
 ```
 
 - `GET /query` は 1 トランザクション (`BEGIN; SELECT count(*) FROM items; SELECT id, v FROM items ORDER BY id LIMIT 10; COMMIT`)
-  を流して `{"count":1000,"items":[…]}` を返し、`Server-Timing: connect;dur=…, db;dur=…` を付ける。
+  を流して `{"count":1000,"items":[…],"where":{"worker":"<colo>","do":"<colo>"}}` を返し、
+  `Server-Timing: connect;dur=…, rtt;dur=…, db;dur=…` を付ける。
+  - `rtt`: tx の外で `SELECT 1` を 1 回投げた往復 (DO ↔ Container の 1 往復の目安)。`db` はその後の tx だけ
+  - `where`: Worker は `request.cf.colo`、DO は DO 内で `cdn-cgi/trace` を初回だけ引いた `colo` (取れなければ null)
+  - Container は起動時に `cdn-cgi/trace` の `colo` / `loc` だけを 1 行ログに出す (Workers Logs で見る)
 - **`Row` はトランザクションの中で owned な値に変換してから COMMIT する。** `Row` は prepared statement を
   握っていて、COMMIT 後に drop すると Close がトランザクションの外に出て別のサーバー接続へ回り、
   `prepared statement "s1" already exists` (42P05) になる (transaction mode のプーラー越しの罠)。

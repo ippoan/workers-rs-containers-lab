@@ -9,8 +9,9 @@
 # role `bench` と表 `items` (1000 行) を作る (start.sh)。build context はこのディレクトリ。
 FROM postgres:16
 
+# curl: 起動時に cdn-cgi/trace で Container の居場所 (colo / loc) をログに出す (start.sh)
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends pgbouncer \
+    && apt-get install -y --no-install-recommends pgbouncer curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # 認証は trust。postgres も PgBouncer も Container の外へは出ず、到達経路は LabDb の

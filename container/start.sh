@@ -15,6 +15,13 @@ trap 'echo "[lab-db] failed at line $LINENO (exit $?)" >&2' ERR
 t0=$(date +%s%3N)
 log() { echo "[lab-db +$(($(date +%s%3N) - t0))ms] $*"; }
 
+# Container がどこで動いているか (Workers Logs で DO の colo と見比べる)。colo と loc だけを出す
+# (trace の他の行は出さない)。cold start の計測に足さないよう裏で走らせ、取れなくても起動は止めない
+{
+  where=$(curl -s -m 5 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -E '^(colo|loc)=' | tr '\n' ' ' || true)
+  log "where: ${where:-unknown}"
+} &
+
 initdb -D "$PGDATA" -U postgres --auth=trust --no-sync >/dev/null
 # Cloudflare Containers には /var/run/postgresql (既定の unix socket の置き場) も /dev/shm も無い
 pg_ctl -D "$PGDATA" -w -s -o "-c listen_addresses=127.0.0.1 -c unix_socket_directories=/tmp -c fsync=off" start

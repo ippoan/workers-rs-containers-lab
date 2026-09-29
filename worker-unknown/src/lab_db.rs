@@ -11,8 +11,10 @@
 //! - 常時起動にはしない: 最後の接続が閉じてから [`SLEEP_AFTER_MS`] 経つと alarm で Container を
 //!   止める (`@cloudflare/containers` の既定 sleepAfter と同じ 10 分)。ディスクは揮発なので、
 //!   次の起動は空の DB から作り直す (= cold start の計測はこの後に回す)
+//! - HTTP の口は `GET /where` だけ: この DO が動いている colo を text で返す (Container との距離を見るため。
+//!   `cdn-cgi/trace` を初回に 1 回だけ引き、以後はメモリの値を返す)
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::pin::pin;
 use std::time::Duration;
 
@@ -20,8 +22,8 @@ use futures_util::future::{select, Either};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use wasm_bindgen::prelude::*;
 use worker::{
-    console_error, console_log, durable_object, Container, Date, Delay, Env, Request, Response,
-    Result, Socket, State,
+    console_error, console_log, durable_object, Container, Date, Delay, Env, Fetch, Request,
+    Response, Result, Socket, State,
 };
 
 use crate::db::PGBOUNCER_PORT;
@@ -49,6 +51,19 @@ pub struct LabDb {
     state: State,
     /// 中継中の接続数
     active: Cell<u32>,
+    /// この DO が動いている colo (初回の `GET /where` で `cdn-cgi/trace` から取る)
+    colo: RefCell<Option<String>>,
+}
+
+/// `cdn-cgi/trace` の `colo=` を引く (この isolate が動いている Cloudflare のデータセンター)
+async fn trace_colo() -> Result<String> {
+    // Fetch::Url (Rust の url crate でパース) は idna の表を bundle に引き込むので、JS の Request で組む
+    let req = Request::new("https://cloudflare.com/cdn-cgi/trace", worker::Method::Get)?;
+    let body = Fetch::Request(req).send().await?.text().await?;
+    body.lines()
+        .find_map(|l| l.strip_prefix("colo="))
+        .map(str::to_owned)
+        .ok_or_else(|| "cdn-cgi/trace has no colo=".into())
 }
 
 /// 1 回の試行: PgBouncer へ繋ぎ、クライアントの最初のメッセージを送り、最初の応答を読む。
@@ -184,11 +199,25 @@ impl worker::DurableObject for LabDb {
         Self {
             state,
             active: Cell::new(0),
+            colo: RefCell::new(None),
         }
     }
 
-    async fn fetch(&self, _req: Request) -> Result<Response> {
-        Response::error("LabDb accepts TCP only", 404)
+    async fn fetch(&self, req: Request) -> Result<Response> {
+        if req.path() != "/where" {
+            return Response::error("LabDb accepts TCP and GET /where only", 404);
+        }
+        let cached = self.colo.borrow().clone();
+        let colo = match cached {
+            Some(c) => c,
+            None => {
+                let c = trace_colo().await?;
+                *self.colo.borrow_mut() = Some(c.clone());
+                c
+            }
+        };
+        // 本文は colo の 3 文字だけ (Worker 側で JSON を解かずに済ませ、bundle を増やさない)
+        Response::ok(colo)
     }
 
     async fn connect(&self, mut socket: Socket) -> Result<()> {
