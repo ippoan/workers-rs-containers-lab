@@ -4,7 +4,9 @@
 //! それ以外のパスは 404。
 //!
 //! 応答ヘッダー `Server-Timing: connect;dur=…, rtt;dur=…, db;dur=…` は bench/measure.mjs が読む
-//! (`rtt` は tx の外で `SELECT 1` を 1 回投げた往復 = DO ↔ Container の 1 往復の目安)。
+//! (`rtt` は tx の外で `SELECT 1` を 1 回投げた往復 = Worker → DO → Container の 1 往復)。
+//! `GET /query?rtt_do=1` のときだけ、応答の前に DO の `GET /rtt` を呼び、DO の中で測った
+//! DO ↔ Container だけの往復を `rtt_do;dur=…` として足す (DO への往復が 1 回増えるので既定では呼ばない)。
 //! JSON の `where` は Worker と DO `LabDb` が動いている colo (Container との距離を見るため)。
 //! ローカル (wrangler dev) の Date.now は CPU 実行中も進むが、Cloudflare 上では Spectre 対策で
 //! I/O まで止まるので、CPU 時間は dashboard で見る。
@@ -77,6 +79,14 @@ fn error_json(code: &str, status: u16) -> Result<Response> {
     Ok(Response::from_json(&ErrorBody { error: code })?.with_status(status))
 }
 
+/// `?rtt_do=1` があるか (url crate で解くと idna の表を bundle に引き込むので、文字列で見る)
+fn wants_rtt_do(req: &Request) -> bool {
+    req.inner()
+        .url()
+        .split_once('?')
+        .is_some_and(|(_, q)| q.split('&').any(|kv| kv == "rtt_do=1"))
+}
+
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     if req.method() != Method::Get || req.path() != "/query" {
@@ -116,6 +126,18 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             None
         }
     };
+    // 計測の外。DO が測った DO ↔ Container の往復 (?rtt_do=1 のときだけ)
+    let rtt_do = if wants_rtt_do(&req) {
+        match db::do_rtt(&env).await {
+            Ok(ms) => Some(ms),
+            Err(e) => {
+                console_error!("lab: rtt_do: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let location = Where {
         worker: req.cf().map(|cf| cf.colo()),
         durable_object,
@@ -125,9 +147,10 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         items,
         location,
     })?;
-    resp.headers_mut().set(
-        "server-timing",
-        &format!("connect;dur={connect_ms}, rtt;dur={rtt_ms}, db;dur={db_ms}"),
-    )?;
+    let mut timing = format!("connect;dur={connect_ms}, rtt;dur={rtt_ms}, db;dur={db_ms}");
+    if let Some(ms) = rtt_do {
+        timing.push_str(&format!(", rtt_do;dur={ms}"));
+    }
+    resp.headers_mut().set("server-timing", &timing)?;
     Ok(resp)
 }

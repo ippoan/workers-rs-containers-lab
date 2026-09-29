@@ -6,13 +6,21 @@
 
 use tokio_postgres::config::SslMode;
 use tokio_postgres::{Client, Config, NoTls};
-use worker::{console_error, Env, Socket};
+use worker::{console_error, Env, ObjectNamespace, Socket, Stub};
 
 /// DO binding。1 個の DO (= 1 個の Container) に全リクエストを集める
 pub const LAB_DB_BINDING: &str = "LAB_DB";
 const LAB_DB_NAME: &str = "lab-db";
+/// DO を作るときの置き場所の希望 (北東アジア)。location hint が効くのは DO が最初に作られるときだけで、
+/// 既にある DO は動かない。(A) と (B) は同じ名前 + 同じ hint で同じ DO を取る
+const LAB_DB_LOCATION_HINT: &str = "apac-ne";
 /// Container 内の PgBouncer のポート (container/pgbouncer.ini)
 pub const PGBOUNCER_PORT: u16 = 6432;
+
+fn lab_db(ns: &ObjectNamespace) -> Result<Stub, String> {
+    ns.get_by_name_with_location_hint(LAB_DB_NAME, LAB_DB_LOCATION_HINT)
+        .map_err(|e| format!("lab-db stub: {e}"))
+}
 
 /// DO `LabDb` が動いている colo (`GET /where`)。DO の場所は変わらないので、Worker の isolate でも
 /// 1 回取れたら覚えておき、以後は DO へ聞きに行かない (計測の total に余計な往復を足さないため)
@@ -23,11 +31,10 @@ pub async fn do_colo(env: &Env) -> Result<String, String> {
     if let Some(c) = DO_COLO.with(|c| c.borrow().clone()) {
         return Ok(c);
     }
-    let stub = env
+    let ns = env
         .durable_object(LAB_DB_BINDING)
-        .and_then(|ns| ns.get_by_name(LAB_DB_NAME))
-        .map_err(|e| format!("lab-db stub: {e}"))?;
-    let mut resp = stub
+        .map_err(|e| format!("no {LAB_DB_BINDING} binding: {e}"))?;
+    let mut resp = lab_db(&ns)?
         .fetch_with_str("https://lab-db/where")
         .await
         .map_err(|e| format!("lab-db /where: {e}"))?;
@@ -42,6 +49,24 @@ pub async fn do_colo(env: &Env) -> Result<String, String> {
     Ok(colo)
 }
 
+/// DO の中で測った DO ↔ Container の 1 往復 (ms、`GET /rtt`)。Container が止まっていれば DO は 503 を返す
+pub async fn do_rtt(env: &Env) -> Result<u64, String> {
+    let ns = env
+        .durable_object(LAB_DB_BINDING)
+        .map_err(|e| format!("no {LAB_DB_BINDING} binding: {e}"))?;
+    let mut resp = lab_db(&ns)?
+        .fetch_with_str("https://lab-db/rtt")
+        .await
+        .map_err(|e| format!("lab-db /rtt: {e}"))?;
+    if resp.status_code() != 200 {
+        return Err(format!("lab-db /rtt: status {}", resp.status_code()));
+    }
+    let body = resp.text().await.map_err(|e| format!("lab-db /rtt: {e}"))?;
+    body.trim()
+        .parse()
+        .map_err(|_| format!("lab-db /rtt: not a number: {body}"))
+}
+
 pub async fn connect(env: &Env) -> Result<Client, String> {
     let ns = env
         .durable_object(LAB_DB_BINDING)
@@ -52,11 +77,8 @@ pub async fn connect(env: &Env) -> Result<Client, String> {
 /// DO への TCP をそのまま postgres のソケットとして使う (DO が Container の PgBouncer へ
 /// バイトを中継する)。DO → Container は Cloudflare 内なので平文。PgBouncer は trust 認証で、
 /// superuser ではない `bench` で繋ぐ。
-async fn connect_container(ns: &worker::ObjectNamespace) -> Result<Client, String> {
-    let stub = ns
-        .get_by_name(LAB_DB_NAME)
-        .map_err(|e| format!("lab-db stub: {e}"))?;
-    let socket = stub
+async fn connect_container(ns: &ObjectNamespace) -> Result<Client, String> {
+    let socket = lab_db(ns)?
         .connect(&format!("{LAB_DB_NAME}:{PGBOUNCER_PORT}"))
         .map_err(|e| format!("lab-db connect: {e}"))?;
     let mut config = Config::new();

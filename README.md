@@ -22,14 +22,18 @@ Worker → Durable Object → Cloudflare Containers の PgBouncer (transaction m
 
 ### 比較
 
-staging (Access 越し) の実測。warm は p50、単位は ms。B の staging の値は計測後に埋める。
+staging (Access 越し) の実測。warm は p50、単位は ms。bundle は rtt_do と location hint を足した後の値。
+時間の列は placement を入れる前の A の値で、placement を入れた後の A・B の値は計測後に埋める。
 
-| worker | wasm raw (B) | wasm gzip (B) | warm total | connect | rtt | db | cold total |
-|---|---|---|---|---|---|---|---|
-| A `worker-unknown` | 608,873 | 242,904 | 144 | 22 | 14 | 83 | 2,000 (connect 1,750) |
-| B `worker-emscripten` | 515,221 | 226,943 | | | | | |
+| worker | wasm raw (B) | wasm gzip (B) | warm total | connect | rtt | rtt_do | db | cold total |
+|---|---|---|---|---|---|---|---|---|
+| A `worker-unknown` | 618,048 | 246,833 | 144 | 22 | 14 | | 83 | 2,000 (connect 1,750) |
+| B `worker-emscripten` | 518,882 | 228,323 | | | | | | |
 
 - A の where は Worker=KIX / DO=NRT。B は A と同じ DO・Container を使う
+- **Worker の拠点で往復が大きく変わる** (placement 前の実測: Worker=SIN の回は total p50 約 800 ms / rtt 80 ms、
+  NRT/KIX の回は約 200 ms / rtt 11〜18 ms)。ターゲットを比べるときは拠点をそろえる
+  (staging は Placement Hints で Worker を `aws:ap-northeast-1` の近くに寄せ、`measure.mjs --same-colo` で拠点ごとに集計する)
 - B の bundle は wasm のほかに emscripten の JS glue (`build/index.js`、約 47 KB) を持つ
 
 ## 構成
@@ -41,6 +45,7 @@ worker-unknown/     独立 Cargo workspace (toolchain 1.92.0)
   src/lib.rs        GET /query だけ。それ以外は 404
   src/db.rs         DO LAB_DB へ Stub::connect → tokio-postgres の handshake (user bench / db postgres)
   src/lab_db.rs     DO LabDb: Container の getTcpPort(6432) へ TCP を中継。最後の接続から 10 分で Container を止める
+                    HTTP の口は GET /where (DO の colo) と GET /rtt (DO ↔ Container の往復)
 worker-emscripten/  独立 Cargo workspace (toolchain beta-2026-09-20、target wasm32-unknown-emscripten)
   src/main.rs       A の src/lib.rs の移植 (bin。空の fn main)
   src/db.rs         A の src/db.rs の移植。DO は持たず、wrangler.toml の script_name で A の LabDb を参照する
@@ -51,13 +56,19 @@ bench/              bundle-size.sh / measure.mjs
 - `GET /query` は 1 トランザクション (`BEGIN; SELECT count(*) FROM items; SELECT id, v FROM items ORDER BY id LIMIT 10; COMMIT`)
   を流して `{"count":1000,"items":[…],"where":{"worker":"<colo>","do":"<colo>"}}` を返し、
   `Server-Timing: connect;dur=…, rtt;dur=…, db;dur=…` を付ける。
-  - `rtt`: tx の外で `SELECT 1` を 1 回投げた往復 (DO ↔ Container の 1 往復の目安)。`db` はその後の tx だけ
+  - `rtt`: Worker が tx の外で `SELECT 1` を 1 回投げた往復 (**Worker → DO → Container** の 1 往復)。`db` はその後の tx だけ
+  - `rtt_do`: `GET /query?rtt_do=1` のときだけ付く。DO の `GET /rtt` が DO の中で Container へ新しく繋ぎ、`SELECT 1` を
+    1 回投げた往復 (**DO ↔ Container だけ**)。DO への往復が 1 回増えるので既定では測らない。
+    Container が止まっていれば DO は起動せずに 503 を返し、`rtt_do` は付かない
   - `where`: Worker は `request.cf.colo`、DO は DO 内で `cdn-cgi/trace` を初回だけ引いた `colo` (取れなければ null)
   - Container は起動時に `cdn-cgi/trace` の `colo` / `loc` だけを 1 行ログに出す (Workers Logs で見る)
 - **`Row` はトランザクションの中で owned な値に変換してから COMMIT する。** `Row` は prepared statement を
   握っていて、COMMIT 後に drop すると Close がトランザクションの外に出て別のサーバー接続へ回り、
   `prepared statement "s1" already exists` (42P05) になる (transaction mode のプーラー越しの罠)。
 - DB への経路は staging の Container だけ。DO → Container は Cloudflare 内の平文、PgBouncer は trust 認証。
+- 置き場所: staging の Worker は `[env.staging.placement] region = "aws:ap-northeast-1"` (Placement Hints。トップレベルには書かない)。
+  DO は A・B とも同じ名前 + location hint `apac-ne` で取る (`get_by_name_with_location_hint`)。hint が効くのは
+  DO が最初に作られるときだけで、既にある DO は動かない。
 
 ## 公開範囲
 
@@ -87,6 +98,10 @@ bash bench/bundle-size.sh lab-emscripten worker-emscripten/build/index_bg.wasm
 # warm: 暖機 1 回 + N 回の p50 / p95 (URL と Access の service token は env から)
 LAB_URL=https://<staging のホスト>/query CF_ACCESS_CLIENT_ID=… CF_ACCESS_CLIENT_SECRET=… \
   node bench/measure.mjs -n 50
+
+# Worker の拠点ごとの集計は常に出る (拠点が混ざると warning)。1 拠点だけで p50 / p95 を出すなら --same-colo、
+# DO ↔ Container だけの往復も見るなら --rtt-do (total は DO への往復 1 回分大きくなる)
+LAB_URL=… CF_ACCESS_CLIENT_ID=… CF_ACCESS_CLIENT_SECRET=… node bench/measure.mjs -n 50 --rtt-do --same-colo NRT
 
 # cold: Container が 10 分の alarm で止まった後に 1 回だけ
 LAB_URL=… CF_ACCESS_CLIENT_ID=… CF_ACCESS_CLIENT_SECRET=… node bench/measure.mjs --cold
