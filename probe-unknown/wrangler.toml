@@ -1,4 +1,4 @@
-# wasm32-unknown-unknown 版の probe (GET /zip?mb=N・/sign・/pdf)。Container と DO は使わない。
+# wasm32-unknown-unknown 版の probe (GET /zip?mb=N[&mode=copy|stream|flush]・/sign・/pdf)。Container と DO は使わない。
 #
 # 到達経路を絞る (public repo なので、ホスト名・account_id・Access の設定はここに書かない):
 #   - トップレベル: workers_dev = false / preview_urls = false、route / routes / custom_domain を書かない
@@ -24,3 +24,10 @@ enabled = true
 # Placement Hints: DB 比較の worker と同じ置き場所 (AWS 東京リージョンの近く)。staging だけ
 [env.staging.placement]
 region = "aws:ap-northeast-1"
+
+# mode=flush が運行ごとの CSV を書き出す先 (リクエストの終わりに prefix ごと消す)。
+# bucket は wrangler deploy が無ければこの名前で作る (wrangler 4.143.0 の resource provisioning。
+# bucket_name を書いた R2 binding も、bucket が存在しなければ provision の対象になる)。staging だけ
+[[env.staging.r2_buckets]]
+binding = "LAB_R2"
+bucket_name = "lab-probe-staging"

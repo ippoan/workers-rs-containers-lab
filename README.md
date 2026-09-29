@@ -62,6 +62,26 @@ rsa 0.9.10 / printpdf 0.8.2)。
   1 行ずつ、KUDGIVT.csv = ZIP が N MB になるまでイベント行。圧縮率は約 4.6 倍)。生成 (`input.gen_ms`) と処理
   (`process.*_ms`) を分け、処理で数えた行数・運行NO の数が生成時と一致したかを `match` で返す。
   zip は `default-features = false, features = ["deflate"]` (rust-alc-api は default = bzip2 / zstd / xz の C ライブラリ込み)
+- `GET /zip?mb=N&mode=flush` (**probe-unknown だけ**。`probe-unknown/src/flush.rs`): 運行ごとに R2 (`LAB_R2`) へ書き出して
+  捨てる版 (`crates/alc-dtako/src/dtako_upload.rs` の `split_csv_from_r2` の作りを変えたもの)。ZIP 本体は Vec で持ち、
+  エントリを 1 つずつ**行単位で** SHIFT_JIS → UTF-8 にし (エントリ全体の文字列を作らない)、運行NO が変わったらその運行の
+  CSV (ヘッダー + 行) を `probe-flush/<時刻>-<乱数>/unko/<運行NO>/<CSV>` に PUT してバッファを手放す。同時に走らせる PUT は 8 まで。
+  応答は copy / stream と同じ項目に加え、`puts` (件数・総バイト数・失敗・同時数の最大・1 件の最大) と
+  `process.put_wait_ms` (PUT の完了を待った時間)、`files[].runs` (運行NO の連続した塊の数)。書き出したものは応答の前に
+  prefix ごと消す (`cleanup`)。`match` は行数・運行NO の数・CSV のバイト数の一致に加え、PUT が全部成功し運行ごとに 1 件ずつだったか。
+  - **行の並び**: rust-alc-api の fixture (`tests/common/mod.rs` の dtako ZIP) は KUDGURI・KUDGIVT とも運行NO 昇順で、
+    運行ごとに行が連続している (本体の `group_csv_by_unko_no` は HashMap なので並びに依存せず、保証ではない。実データは未確認)。
+    flush はこの並びを前提にし、入力は運行NO 順の生成器 (`zip_probe::generate_sorted`) で作る。連続していない運行が出たら
+    `<CSV>.part<n>` として別に PUT し、`runs > groups` (= `match: false`) で分かるようにする (結合はしない)
+  - 運行NO 順の KUDGIVT は混ざった順より縮むので、同じ N MB でも CSV は大きい (KUDGIVT の SJIS は 1 MB で 6.7 MB = copy / stream の入力の約 1.5 倍、20 MB で 169 MB)
+  - **CPU の重さは Workers Logs / Observability のリクエストごとの CPU 時間で比べる**。Worker 内の時計は I/O まで進まないので
+    `process.process_ms` は staging ではほぼ 0 になり (`put_wait_ms` は PUT の I/O を含むので進む)、手元の wall には入口の
+    拠点のぶれが乗る。応答で見るのは heap_peak / 線形メモリ / 件数 (`match`・`runs`・`groups`・`puts.count`)
+  - ローカル (`wrangler dev --env staging`、手元の R2) の実測: 1 MB は heap_peak 1.7 MiB、20 MB は 20.8 MiB
+    (うち ZIP 本体 20.0 MiB)。どちらも `match: true`、PUT 6000 件
+  - R2 の bucket `lab-probe-staging` は deploy 時に無ければ wrangler が作る (4.143.0 の resource provisioning。`bucket_name`
+    を書いた binding でも、その bucket が無ければ provision する)。R2 の呼び出しも subrequest に数える
+    (Workers Paid は既定 10,000/リクエスト)。1 リクエストで PUT 6000 + list / delete 各十数回
 - `GET /sign`: (a) `jwt_ring` = jsonwebtoken (ring) の RS256 (`from_rsa_pem` + `encode`、`crates/alc-notify/src/clients/lineworks.rs`)、
   (b) `jwt_rsa` = pure Rust の rsa crate の RS256、(c) `aes_gcm_ring` = ring の AES-256-GCM
   (`crates/alc-core/src/auth_lineworks.rs` の `encrypt_secret` / `decrypt_secret` の写し)。各 20 回の平均。
@@ -76,7 +96,7 @@ rsa 0.9.10 / printpdf 0.8.2)。
   - `heap_before` / `heap_peak`: グローバルアロケータ (`probe-shared/mem.rs`) で数えた、区間の前に生きていた確保と、
     区間中に同時に生きていた確保の最大。isolate の前の処理に左右されないので、**copy と stream の比較はこちらで見る**
     (断片化や線形メモリの伸ばし方の分は入らないので、線形メモリより小さい)
-  - bench/probe.mjs は mb ごとに stream を先、copy を後に叩く (線形メモリの列が後の版に隠れないように)
+  - bench/probe.mjs は mb ごとに flush (unknown だけ) → stream → copy の順に叩く (線形メモリの列が後の版に隠れないように)
 - **そのターゲットでビルドできない方式は feature (`ring` / `pdf`) で外し、`{"unsupported": "<理由>"}` を返す** (/pdf は 501)
 
 ### ビルドできたか
@@ -154,7 +174,7 @@ worker-unknown/     (A) 独立 Cargo workspace (toolchain 1.92.0)
 worker-emscripten/  (B) 独立 Cargo workspace (toolchain beta-2026-09-20、target wasm32-unknown-emscripten)
   src/main.rs       A の src/lib.rs の移植 (bin。空の fn main)
   src/db.rs         A の src/db.rs の移植。A と同じく script_name で lab-db の LabDb を参照する
-probe-unknown/      独立 Cargo workspace (toolchain 1.92.0)。GET /zip・/sign・/pdf (下の probe-shared を読む)
+probe-unknown/      独立 Cargo workspace (toolchain 1.92.0)。GET /zip・/sign・/pdf (下の probe-shared を読む)。/zip の mode=flush (R2) はここだけ
 probe-emscripten/   独立 Cargo workspace (toolchain beta-2026-09-20)。同じ口。ring と pdf は feature で外す
 probe-shared/       probe の処理 (zip_probe.rs / sign.rs / pdf.rs / mem.rs / probe.rs) と fonts/ (NotoSansJP + OFL)
 scripts/            check-exposure.sh (wrangler.toml の公開範囲の検査) と陰性対照
@@ -232,7 +252,7 @@ LAB_URL=… CF_ACCESS_CLIENT_ID=… CF_ACCESS_CLIENT_SECRET=… node bench/measu
 ```
 
 ```bash
-# probe: /zip?mb=1,5,10,20・/sign・/pdf を各 10 回 (暖機 1 回を除く) 叩き、両ターゲットの p50 を表で並べる
+# probe: /zip?mb=1,5,10,20 (flush / stream / copy)・/sign・/pdf を各 10 回 (暖機 1 回を除く) 叩き、両ターゲットの p50 を表で並べる
 PROBE_UNKNOWN_URL=https://<probe-unknown の staging> PROBE_EMSCRIPTEN_URL=https://<probe-emscripten の staging> \
   CF_ACCESS_CLIENT_ID=… CF_ACCESS_CLIENT_SECRET=… node bench/probe.mjs -n 10
 ```

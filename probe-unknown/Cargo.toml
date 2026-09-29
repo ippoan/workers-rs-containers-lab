@@ -24,6 +24,8 @@ pdf = ["dep:printpdf"]
 [dependencies]
 base64 = "=0.22.1"
 encoding_rs = "=0.8.35"
+# mode=flush の PUT を上限つきで並べる (FuturesUnordered)。版は worker が引いているものと同じ
+futures-util = { version = "=0.3.34", default-features = false, features = ["alloc"] }
 # rsa (rand_core 0.6) の OsRng を wasm32-unknown-unknown で crypto.getRandomValues に向ける
 getrandom = { version = "0.2", features = ["js"] }
 jsonwebtoken = { version = "=9.3.1", optional = true }
