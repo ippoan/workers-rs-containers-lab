@@ -83,8 +83,9 @@ bench/              bundle-size.sh / measure.mjs
   デプロイ直後に token 無しで `GET <staging>/query` を叩き、302 / 403 (Access が止めた) 以外なら job を落とす
   (ルートが行き渡るまでの 404 だけは 10 秒おきに最大 12 回待つ。200 などは即 fail)。
   staging の URL は `::add-mask::` で伏せ、ログに実ホスト名を出さない。
-  B (`lab-emscripten-staging`) は A の DO を参照するので、`deploy-staging-emscripten` が `deploy-staging` の後に
-  同じ手順 (伏せ方・Access の検査) で回る。
+  B (`lab-emscripten-staging`) は `deploy-staging-emscripten` が、`exposure` / `worker-emscripten` が通った後に
+  `deploy-staging` と並列に同じ手順 (伏せ方・Access の検査) で回る (B が参照する A の DO は A のスクリプトに既にあるので、
+  A のデプロイを待たない。A の DO を新しく作り直す変更のときは、A のデプロイが先に済むまで B の /query は失敗しうる)。
 - 計測は CI に入れない (Access の service token は GitHub に置かない)。
 - green の PR は CI の `auto-merge` job (ippoan/ci-workflows の reusable) で自動 merge される。
 

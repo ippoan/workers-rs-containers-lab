@@ -192,11 +192,12 @@ jobs:
           done
           echo "::error::token 無しで 12 回とも 404 (workers.dev のルートが行き渡らない。Access の状態も dashboard で確かめること)"
           exit 1
-  # (B) の staging。DO `LabDb` と Container は (A) lab-unknown-staging のものを script_name で参照するので、
-  # A のデプロイ (deploy-staging) が済んでから回す。伏せ方と Access の検査は deploy-staging と同じ。
+  # (B) の staging。DO `LabDb` と Container は (A) lab-unknown-staging のものを script_name で参照する。
+  # DO は A のスクリプトに既にあるので A のデプロイを待たず、deploy-staging と並列に回す (concurrency の group も別)。
+  # 伏せ方と Access の検査は deploy-staging と同じ。
   deploy-staging-emscripten:
     name: deploy staging (lab-emscripten-staging)
-    needs: [exposure, worker-emscripten, deploy-staging]
+    needs: [exposure, worker-emscripten]
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     concurrency:
