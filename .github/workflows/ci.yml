@@ -124,7 +124,7 @@ jobs:
         run: bash ../bench/bundle-size.sh lab-emscripten build/index_bg.wasm
 
   # probe (wasm32-unknown-unknown)。/zip・/sign・/pdf。ring の C は ubuntu-latest の clang で wasm32 向けにコンパイルされる。
-  # PDF のフォント (9.6 MB) を同梱するので raw は約 18 MB (上限は圧縮前 64 MiB。bundle-size.sh が超えたら落とす)
+  # PDF のフォント (9.6 MB) を同梱するので raw は約 19.5 MB (--panic-unwind。上限は圧縮前 64 MiB。bundle-size.sh が超えたら落とす)
   probe-unknown:
     name: probe-unknown (wasm32-unknown-unknown)
     runs-on: ubuntu-latest
@@ -138,17 +138,27 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
           components: rustfmt, clippy
+      # --panic-unwind 用 (worker-build が `cargo +nightly build -Z build-std=std,panic_unwind` を打つ)。
+      # worker-build 0.8.7 は toolchain 名 `nightly` を決め打ちし、rustup は `nightly` という名前の link を拒むので日付で固定できない。
+      # 浮動の nightly を使い、ビルドした版をログと step summary に残す (clippy / fmt は上の 1.92.0 のまま)
+      - name: nightly (rust-src + wasm32-unknown-unknown)
+        run: |
+          rustup toolchain install nightly --profile minimal --component rust-src --target wasm32-unknown-unknown
+          line="probe-unknown nightly: $(rustc +nightly -V)"
+          echo "$line"
+          echo "$line" >>"$GITHUB_STEP_SUMMARY"
       - uses: swatinem/rust-cache@v2
         with:
           # build の job とデプロイの job で同じキャッシュを使う (既定のキーは job 名を含み、デプロイから引けない)
-          shared-key: probe-unknown
+          # abort 版の成果物と target を取り合わないよう、unwind 版は別のキー
+          shared-key: probe-unknown-unwind
           workspaces: probe-unknown
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --check
       - run: cargo clippy --target wasm32-unknown-unknown -- -D warnings
       # worker-build の版は wrangler.toml の [build] command と Cargo.toml の worker と揃える
       - run: cargo install -q worker-build@0.8.7 --locked
-      - run: worker-build --release
+      - run: worker-build --release --panic-unwind
       - name: bundle サイズ (上限は圧縮前 64 MiB)
         run: bash ../bench/bundle-size.sh probe-unknown build/index_bg.wasm
 
@@ -455,10 +465,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.92.0
         with:
           targets: wasm32-unknown-unknown
+      # [build] command の --panic-unwind 用。build の job と同じ (浮動の nightly)
+      - name: nightly (rust-src + wasm32-unknown-unknown)
+        run: |
+          rustup toolchain install nightly --profile minimal --component rust-src --target wasm32-unknown-unknown
+          rustc +nightly -V
       - uses: swatinem/rust-cache@v2
         with:
           # build の job とデプロイの job で同じキャッシュを使う (既定のキーは job 名を含み、デプロイから引けない)
-          shared-key: probe-unknown
+          shared-key: probe-unknown-unwind
           workspaces: probe-unknown
           save-if: false
       # wrangler.toml の [build] command と同じ版 (入っていれば [build] の cargo install は即終わる)
