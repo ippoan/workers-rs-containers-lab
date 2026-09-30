@@ -11,7 +11,8 @@ workers_dev = false
 preview_urls = false
 
 [build]
-command = "cargo install -q worker-build@0.8.7 --locked && worker-build --release"
+# --panic-unwind は浮動の nightly (+ rust-src) を使う (worker-build 0.8.7 が toolchain 名 `nightly` を決め打ち。README「panic=unwind」)
+command = "cargo install -q worker-build@0.8.7 --locked && worker-build --release --panic-unwind"
 
 [env.staging]
 name = "lab-probe-unknown-staging"

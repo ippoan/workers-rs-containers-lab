@@ -48,7 +48,7 @@ DB とは別に、rust-alc-api (15bf45e) の「Worker に移しにくい処理�
 
 | worker | ターゲット | staging |
 |---|---|---|
-| `probe-unknown/` | `wasm32-unknown-unknown` (toolchain 1.92.0) | `lab-probe-unknown-staging` |
+| `probe-unknown/` | `wasm32-unknown-unknown` (toolchain 1.92.0。ビルドは `worker-build --release --panic-unwind` で浮動の `nightly`、下の「panic=unwind」) | `lab-probe-unknown-staging` |
 | `probe-emscripten/` | `wasm32-unknown-emscripten` (toolchain `beta-2026-09-20`、`experimental_tokio`、[patch] は worker-emscripten と同じ) | `lab-probe-emscripten-staging` |
 
 処理のコードは `probe-shared/` の 1 つだけで、両 crate が `#[path]` で読む (違うのは crate の入口と feature)。
@@ -92,7 +92,15 @@ rsa 0.9.10 / printpdf 0.8.2)。
   SIL OFL 1.1、`probe-shared/fonts/OFL.txt`) を `include_bytes!`。時間は `Server-Timing: font / render / total`、
   大きさとメモリは `x-probe-pdf-bytes` / `x-probe-memory-before` / `x-probe-memory-after`
 - `GET /_lab/panic`: わざと panic する (panic やメモリ不足で中断した後、次のリクエストが回復するかを測るため)。
-  メモリ不足の口は `/zip?mb=20&mode=copy` (heap_peak 542 MiB) を使う。staging は Access 越しにしか届かない
+  メモリ不足の口は `/zip?mb=20&mode=copy` (heap_peak 542 MiB) を使う。staging は Access 越しにしか届かない。
+  ローカル (wrangler@4.143.0 dev) で `/sign` → `/_lab/panic` → `/sign` ×5 を流した結果 (下の「panic=unwind」):
+  - abort (`--panic-unwind` なし): panic は 500 (本文は `The Workers runtime canceled this request because it detected that your Worker's code had hung …`)。
+    dev のログに `Critical RuntimeError: unreachable` と `Reinitializing Wasm application` が出て、直後の `/sign` は `key.cached: false`
+    (isolate の状態が捨てられ、鍵を作り直した)。以降の 4 回は true
+  - unwind: panic は 500 (本文は `PanicError: lab: intentional panic`)。`Reinitializing` は出ず、直後の `/sign` ×5 はすべて 200 で
+    `key.cached: true` (panic の前に作った鍵が残る)。panic と同時に投げた `/sign` ×5 もすべて 200・`cached: true`
+  - メモリ不足はローカルでは試せない (ローカルの workerd は 128 MB を強制せず、`/zip?mb=20&mode=copy` は 200・線形メモリ 566 MiB)。
+    unwind でも OOM は捕まらない見込みで、staging で確かめる
 - どの応答にも `target`・`colo` と、処理の区間のメモリ (`memory`。/zip は生成 `gen` と処理 `process` に分ける) を入れる:
   - `before` / `after` / `grown`: 線形メモリ (`core::arch::wasm32::memory_size`) の前・後・後 − 前。Worker の 128 MB に
     効く実物だが**伸びたら縮まない**ので、同じ isolate で先に大きい処理が走っていれば `grown` は 0 (isolate の高水位)
@@ -120,13 +128,32 @@ rsa 0.9.10 / printpdf 0.8.2)。
   `relocation R_WASM_MEMORY_ADDR_SLEB cannot be used against symbol …; recompile with -fPIC` で落ちる
 - どちらも `worker-build --emscripten --release -- --features ring` / `--features pdf` で再現できる
 
+#### panic=unwind (probe-unknown)
+
+probe-unknown は `worker-build --release --panic-unwind` (worker-build 0.8.7) でビルドする (ippoan/rust-alc-api#694)。
+worker-build は `cargo +nightly build -Z build-std=std,panic_unwind` と `RUSTFLAGS=-Cpanic=unwind` を打ち、shim は `shim-unwind.js` を使う
+(ログに `Compiling to Wasm (with panic=unwind)...`)。`--emscripten` とは併用できないので probe-emscripten は abort のまま。
+clippy / fmt は rust-toolchain.toml の 1.92.0 (stable) のままで、unwind のビルドだけ nightly を使う。
+
+- **nightly は日付で固定できない** (浮動の `nightly` を使う): worker-build 0.8.7 は toolchain 名を `nightly` と決め打ちし
+  (`src/build/target.rs` の `NIGHTLY_TOOLCHAIN`、`cargo +nightly` / `rustc +nightly` / `rustup … --toolchain nightly`)、日付を渡す口が無い。
+  `cargo +<toolchain>` は rustup の最優先の上書きなので `RUSTUP_TOOLCHAIN` も rust-toolchain.toml も効かず、
+  日付版を別名にする `rustup toolchain link nightly <日付版の sysroot>` は `invalid custom toolchain name 'nightly'` で拒否される。
+  CI はビルドした `rustc +nightly -V` をログと step summary に残す (手元で確かめた版: `rustc 1.101.0-nightly (c1070d693 2026-09-28)`)
+- nightly が無ければ worker-build が `rustup toolchain install nightly` と rust-src・wasm32-unknown-unknown の追加を自分で打つ。
+  CI は build / deploy の job で先に入れる (`rustup toolchain install nightly --profile minimal --component rust-src --target wasm32-unknown-unknown`)
+- CI の rust-cache は abort 版と target を取り合わないよう `shared-key: probe-unknown-unwind` にした
+- 手元の CPU (wrangler dev、10 回の中央値、abort → unwind): jwt_ring sign 7.8 → 7.8 ms、jwt_rsa sign 5.65 → 5.9 ms、
+  /pdf render 5 → 4 ms / total 21.5 → 22 ms。ローカルでは差が見えない (staging の CPU 時間は Workers Logs で比べる)
+
 ### bundle
 
 worker-build 0.8.7 --release (wasm-opt 後)。gzip は `gzip -9`。
 
 | worker | features | wasm raw (B) | wasm gzip (B) | JS glue raw / gzip (B) |
 |---|---|---|---|---|
-| probe-unknown | ring + pdf (既定) | 18,430,391 | 9,715,740 | 22,449 / 5,666 |
+| probe-unknown | ring + pdf (既定)、`--panic-unwind` | 19,539,304 | 9,845,172 | 24,383 / 6,187 |
+| probe-unknown | ring + pdf、abort (`--panic-unwind` なし) | 18,430,391 | 9,715,740 | 22,449 / 5,666 |
 | probe-unknown | ring | 1,097,670 | 496,786 | |
 | probe-unknown | なし | 705,086 | 346,697 | |
 | probe-emscripten | なし (既定) | 668,347 | 352,317 | 46,246 / 16,440 |
@@ -135,6 +162,8 @@ worker-build 0.8.7 --release (wasm-opt 後)。gzip は `gzip -9`。
 - PDF (printpdf + フォント) だけで約 17.3 MB (raw) 増える (上限は圧縮前 64 MiB なので収まる。フォント以外の printpdf が
   約 7.7 MB。既定の `html` feature の azul / kuchiki / svg2pdf などを含む)
 - ring は unknown で約 +393 KB (raw)
+- `--panic-unwind` は約 +1.1 MB (raw、+6.0%) / +129 KB (gzip、+1.3%)。unwind の表 (landing pad) と `-Z build-std` で作り直した std の分と見られる。
+  同じ手元で作った abort 版 (raw 18,495,913 / gzip 9,744,974) と比べると +1,043,391 (+5.6%) / +100,198 (+1.0%)
 
 ### ローカルの値 (wrangler@4.143.0 dev、参考値)
 
@@ -292,6 +321,9 @@ worker-build --emscripten --release   # 0.8.7。初回は emsdk 6.0.10 を ~/.ca
 - beta を日付で固定している理由 (`beta-2026-09-20`): 2026-09-27 の beta (1.100.0-beta.1) で cargo の中間生成物の置き場が変わり、
   worker-build 0.8.7 の `step_collect_emscripten_output` が `deps/snippets` を見つけられない (workers-rs main b57ba6e でも未修正)。
   浮動の `beta` だと esbuild が `Could not resolve "./snippets/worker-…/inline0.js"` で落ちる。CI も同じ toolchain を使う。
+- probe-unknown の `--panic-unwind` は浮動の `nightly` を使う (worker-build 0.8.7 が toolchain 名 `nightly` を決め打ちし、
+  rustup が `nightly` という名前の link を拒むため日付で固定できない。詳しくは「panic=unwind」)。nightly の変更でビルドが落ちたら
+  CI の step summary に残した `rustc +nightly -V` と見比べる。
 - ローカルで A・B から lab-db の DO へつなぐには、build してから、`[build]` を外した wrangler.toml のコピーを
   並べて `wrangler dev -c … -c … --env staging` にする (`[build]` はリポジトリの root で走って落ちるため)。
   Worker の TCP は DO まで届くが、Container の起動はローカルでは失敗する (分ける前の A でも同じ)。
