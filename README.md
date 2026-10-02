@@ -245,7 +245,7 @@ Workers の TCP の代わりに **Cloudflare Hyperdrive 経由**で DB に繋ぐ
 | `sequential_ok` / `sequential_held` | 1 つの `PgClient` で `tenant_tx` を続けて 50 回 (A・B を交互)。成功した数 / tx の中の `app.current_tenant_id` が渡したテナントと一致した数 | 50 / 50 |
 | `parallel_tx_total` / `parallel_tx_ok` / `parallel_held` / `parallel_search_path_held` | 並列: kit の接続 4 本 (0・2 本目は A、1・3 本目は B) が各 5 回 `tenant_tx` を流し、tx の中で 50 ms 待ってから設定を読む。試した数 / 成功した数 / **自分の**テナントと一致した数 / `search_path` が `alc_api` だった数 | 4 つとも 20 |
 | `outside_reads` / `leak_outside_tx` | 並列の間、素の接続 2 本が**トランザクションを張らずに** `app.current_tenant_id` を読み続けた回数 (kit の 4 本が終わるまで。上限は各 400 回) / 空でない値が見えた回数 | `outside_reads` > 0 かつ `leak_outside_tx` = 0 |
-| `failed_step` / `errors_by_kind` | kit の系列の失敗。step は `absent` / `connect` / `current_user` / `typed_echo` / `rows_affected` / `sequential` / `parallel` / `outside_connect` / `outside_read`、kind は上と同じ語。kit の接続の失敗は、kit のエラーが段の label を出す口を持たないので固定の語 (`connect`。binding が無いときは `absent`) | どちらも空 |
+| `failed_step` / `errors_by_kind` | kit の系列の失敗。step は `absent` / `connect` / `current_user` / `typed_echo` / `rows_affected` / `sequential` / `parallel` / `outside_connect` / `outside_read`、kind は上と同じ語。kit の接続の失敗 (step `connect`・`absent`) の kind だけは、binding が無ければ固定の語 `absent`、在るのに使えなければ kit の `ConnectError` の `Display` (`hyperdrive <binding 名>: <段>` か `hyperdrive <binding 名>: handshake: <kind>`。段は `binding` / `config_parse` / `socket` / `handshake`) | どちらも空 |
 
 - kit の系列が失敗しても、既存の項目はそのまま出る
 - **kit 経由の接続の task の失敗は `connection_task` に数えられない** (kit が `alc-worker-db: connection task: <kind>` をログに出すだけで、

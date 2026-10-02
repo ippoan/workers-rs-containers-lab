@@ -5,6 +5,7 @@
 //!   業務の表は読まない・書かない。
 //! - **ログに出すのはロール名・真偽・回数・ms と、固定の label・SQLSTATE・`io::ErrorKind` の名前だけ。**
 //!   接続文字列・宛先・認証情報と、エラーの文 (`Display` / `Debug` / DB の message) は出さない ([`kind`])。
+//!   例外は kit の `ConnectError` の `Display` だけ (binding 名・段の固定の label・[`kind`] の語しか出さない作り)。
 //! - 既存の系列 (PoC) の後ろに、共通 crate `alc-worker-db` (ippoan/alc-worker-kit) をそのまま通す系列 ([`Kit`]) を流す
 //!   (Refs ippoan/rust-alc-api#723)。
 //! - [`EXPIRES_AT_MS`] を過ぎたら DB に繋がない。
@@ -175,19 +176,20 @@ impl Kit {
         *self.errors_by_kind.entry(kind).or_insert(0) += 1;
     }
 
-    /// kit の接続を 1 本張る。`ConnectError` は段の label を取り出す口を持たないので、失敗は固定の語で数える
-    /// (`Display` は binding 名と段と kind だけだが、文をログに出さない決まりに揃えて使わない)
+    /// kit の接続を 1 本張る。失敗の kind は、binding が無ければ固定の語 `absent`、在るのに使えなければ
+    /// `ConnectError` の `Display` (`hyperdrive <binding 名>: <段>` か `…: handshake: <kind>` だけを出す作り。
+    /// 宛先・接続文字列・エラーの文は入らない)。`Debug` は使わない
     async fn connect(&mut self, env: &Env) -> Option<PgClient> {
         self.connect_attempts += 1;
-        let absent_or_failed = match hyperdrive::connect(env, HD_BINDING).await {
+        let kind = match hyperdrive::connect(env, HD_BINDING).await {
             Ok(Some(pg)) => {
                 self.connected += 1;
                 return Some(pg);
             }
-            Ok(None) => "absent",
-            Err(_) => "connect",
+            Ok(None) => "absent".to_owned(),
+            Err(e) => e.to_string(),
         };
-        self.fail(("connect", absent_or_failed.to_owned()));
+        self.fail(("connect", kind));
         None
     }
 }
@@ -618,7 +620,7 @@ impl Probe<'_> {
         // 3 状態のうち「binding が無い」: wrangler.toml に無い名前は Ok(None) (繋ぎに行かない)
         match hyperdrive::connect(self.env, HD_ABSENT_BINDING).await {
             Ok(pg) => kit.absent_is_none = pg.is_none(),
-            Err(_) => kit.fail(("absent", "connect".to_owned())),
+            Err(e) => kit.fail(("absent", e.to_string())),
         }
         // 1 本目: ロール・型付きの引数・execute_typed の行数
         if let Some(mut pg) = kit.connect(self.env).await {
