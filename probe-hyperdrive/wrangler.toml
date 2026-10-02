@@ -1,0 +1,32 @@
+# Hyperdrive 経由の DB 接続を測る probe。
+#
+# 外から届く口を持たない: HTTP のハンドラが無く、定時実行 (cron) だけで動く。
+# トップレベルも env.staging も workers_dev = false / preview_urls = false、route / routes / custom_domain を書かない
+# (scripts/check-exposure.sh が --private で「どの env でも false」を検査する)。
+# DB の宛先は Hyperdrive の設定が決める (ここに書くのは設定の ID だけ。宛先・認証情報は Cloudflare 側に在る)。
+# 配信は手動 (wrangler deploy --env staging)。CI は build までで、配信しない。トップレベルは配信しない。
+name = "probe-hyperdrive"
+main = "build/index.js"
+compatibility_date = "2026-09-01"
+workers_dev = false
+preview_urls = false
+
+[build]
+command = "cargo install -q worker-build@0.8.7 --locked && worker-build --release"
+
+# staging: 5 分ごとに 1 回動き、結果を 1 行の JSON でログに出す (README 参照)。
+# 期限 (src/lib.rs の EXPIRES_AT_MS) を過ぎると DB に繋がない。測り終えたら wrangler delete --env staging で片付ける
+[env.staging]
+name = "probe-hyperdrive-staging"
+workers_dev = false
+preview_urls = false
+
+[env.staging.observability]
+enabled = true
+
+[env.staging.triggers]
+crons = ["*/5 * * * *"]
+
+[[env.staging.hyperdrive]]
+binding = "HD"
+id = "6bdf446634034f989d4e094d5510b162"
