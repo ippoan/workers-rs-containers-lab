@@ -197,14 +197,16 @@ Workers の TCP の代わりに **Cloudflare Hyperdrive 経由**で DB に繋ぐ
 
 - **外から届く口が無い**: HTTP のハンドラを持たず、定時実行 (1 分ごと) だけ。`workers_dev` / `preview_urls` はどの env も false、
   route 無し (`check-exposure.sh --private`)。DB の宛先は Hyperdrive の設定が決め、repo に在るのは設定の ID だけ
-- 読むのは `current_user`・`pg_roles` の自分の行・`current_setting` だけ (業務の表は読まない・書かない)
-- 期限: `src/lib.rs` の `EXPIRES_AT_MS` (2026-10-05T00:00:00Z) を過ぎた実行は、DB に繋がず `{"probe":"hyperdrive","expired":true}` だけ出す
+- 読むのは `current_user`・`pg_roles` の自分の行・`current_setting`・`pg_backend_pid` と、渡した引数をそのまま返す文・`pg_sleep` だけ (業務の表は読まない・書かない)
+- 既存の系列 (PoC) の後ろに、分割 worker の共通 crate `alc-worker-db` (ippoan/alc-worker-kit、rev 固定) を**そのまま**通す系列 `kit` を流す
+  (Refs ippoan/rust-alc-api#723)。接続は kit の `hyperdrive::connect`、文は `tenant_tx` の中の型付きの名前なしの文だけ
+- 期限: `src/lib.rs` の `EXPIRES_AT_MS` (2026-10-09T00:00:00Z) を過ぎた実行は、DB に繋がず `{"probe":"hyperdrive","expired":true}` だけ出す
 
 ### 動かし方
 
 1. **配信せずに動かす (第一の手段)**: `cd probe-hyperdrive && npx wrangler@latest dev --remote --env staging --test-scheduled --port <port>`
-   を立て、`curl "http://127.0.0.1:<port>/__scheduled"` で 1 回動かす。Hyperdrive の実物を通る。1 回 13〜19 秒で、
-   結果の JSON は wrangler dev の出力に出る
+   を立て、`curl "http://127.0.0.1:<port>/__scheduled"` で 1 回動かす。Hyperdrive の実物を通る。1 回 13〜19 秒で
+   (`kit` の系列を足す前の値。足した後は未実測)、結果の JSON は wrangler dev の出力に出る
    - wrangler 4.58.0 では `Could not create remote preview session` で立たず、最新 (4.147 系) で立った
    - ローカルの `wrangler dev` (`--remote` なし) は Hyperdrive を通らない
 2. **配信して定時実行で動かす (第二の手段。CI は build までで、配信は手動)**: `wrangler deploy --env staging` の後、
@@ -214,7 +216,8 @@ Workers の TCP の代わりに **Cloudflare Hyperdrive 経由**で DB に繋ぐ
 
 ### ログの読み方
 
-1 回の実行 (接続は逐次に 20 本) で 1 行の JSON:
+1 回の実行で 1 行の JSON。接続は、既存の系列が逐次に 20 本、その後の `kit` の系列が逐次に 2 本 + 並列に 6 本
+(kit の接続 4 本 + 素の接続 2 本。同時に張るのはこの 6 本まで):
 
 | 問い | 中身 | JSON の項目 |
 |---|---|---|
@@ -227,7 +230,32 @@ Workers の TCP の代わりに **Cloudflare Hyperdrive 経由**で DB に繋ぐ
 - 系列の失敗は `failed_step` (`begin` / `set_config` / `read_setting` / `query` / `execute` / `commit` ほか) と `errors_by_kind` に数える。
   接続の task が Err で終わった回数は `connection_task` (同じ形の 1 行 `{"probe":"hyperdrive","error":"connection_task","kind":…}` も出る)
 - エラーの種類 (kind) は、DB のエラーなら SQLSTATE、それ以外は固定の label (`io` / `unexpected_message` / `closed` / `parse` / `other` など。
-  原因が io エラーなら `:<ErrorKind の名前>` が付く)。**エラーの文は出さない**
+  原因が io エラーなら `:<ErrorKind の名前>` が付く)。**エラーの文は出さない**。語に落とすのは共通 crate の `alc_worker_db::kind`
+  (probe が持っていた同じ表を置き換えた)
+
+`kit` (共通 crate の系列。テナントは乱数の UUID 2 つ = A・B):
+
+| 項目 | 中身 | 合格 |
+|---|---|---|
+| `tenants_distinct` | テナント A と B が別の値か (乱数が取れず同じ値だと、並列の「自分の値」の比較が取り違えを検出できない) | true |
+| `absent_is_none` | `wrangler.toml` に無い binding 名 (`HD_ABSENT`) での `hyperdrive::connect` が `Ok(None)` を返したか (3 状態のうち「binding が無い」) | true |
+| `connected` / `connect_attempts` | kit の接続を張れた本数 / 試した本数 (逐次 2 本 + 並列 4 本) | 6 / 6 |
+| `is_runtime_role` | kit の `current_user()` が実行用ロールか | true |
+| `typed_echo_ok` / `typed_echo_total` | 1 つの `tenant_tx` の中で、型付きの引数 (`UUID`・`TIMESTAMPTZ`・`TEXT`・`TEXT[]`・`INT4`) を `query_typed_one` で流し、渡した値がそのまま返った数 / 試した数 | 5 / 5 |
+| `rows_affected_one` / `rows_affected_zero` | `execute_typed` の行数が、真の条件で 1・偽の条件で 0 だったか | どちらも true |
+| `sequential_ok` / `sequential_held` | 1 つの `PgClient` で `tenant_tx` を続けて 50 回 (A・B を交互)。成功した数 / tx の中の `app.current_tenant_id` が渡したテナントと一致した数 | 50 / 50 |
+| `parallel_tx_total` / `parallel_tx_ok` / `parallel_held` / `parallel_search_path_held` | 並列: kit の接続 4 本 (0・2 本目は A、1・3 本目は B) が各 5 回 `tenant_tx` を流し、tx の中で 50 ms 待ってから設定を読む。試した数 / 成功した数 / **自分の**テナントと一致した数 / `search_path` が `alc_api` だった数 | 4 つとも 20 |
+| `outside_reads` / `leak_outside_tx` | 並列の間、素の接続 2 本が**トランザクションを張らずに** `app.current_tenant_id` を読み続けた回数 (kit の 4 本が終わるまで。上限は各 400 回) / 空でない値が見えた回数 | `outside_reads` > 0 かつ上限 (2 本 × 400 = 800) 未満、`leak_outside_tx` = 0 |
+| `kit_backends` / `outside_backends` / `outside_reads_on_kit_backend` | 上流の接続 (DB 側の backend) を共有したか。並列の kit の tx が使った `pg_backend_pid()` の種類の数 / 素の読みが見た pid の種類の数 / 素の読みのうち、kit の tx が既に使った (COMMIT まで済んだ) pid の上だった回数。**数だけで、pid の値は出さない** | 判定には使わない (下の読み方) |
+| `failed_step` / `errors_by_kind` | kit の系列の失敗。step は `absent` / `connect` / `current_user` / `typed_echo` / `rows_affected` / `sequential` / `parallel` / `outside_connect` / `outside_read`、kind は上と同じ語。kit の接続の失敗 (step `connect`・`absent`) の kind だけは、binding が無ければ固定の語 `absent`、在るのに使えなければ kit の `ConnectError` の `Display` (`hyperdrive <binding 名>: <段>` か `hyperdrive <binding 名>: handshake: <kind>`。段は `binding` / `config_parse` / `socket` / `handshake`) | どちらも空 |
+
+- **`leak_outside_tx` = 0 が意味を持つのは `outside_reads_on_kit_backend` > 0 のとき。** 0 なら「素の接続が kit の tx と上流の接続を
+  共有していなかったので、この測り方では漏れを観測できない」と読む (漏れが無いことの証拠にしない)
+- **`outside_reads` が上限 (800) に張り付いていたら不合格に読む**: 読みが上流に届いていない疑い (query cache など)。
+  測る前に、Hyperdrive の設定の query caching が無効であることを読む
+- kit の系列が失敗しても、既存の項目はそのまま出る
+- **kit 経由の接続の task の失敗は `connection_task` に数えられない** (kit が `alc-worker-db: connection task: <kind>` をログに出すだけで、
+  probe からは見えない)。`connection_task` に入るのは、既存の系列の接続と、並列の素の接続 2 本のぶん
 
 ### 結果
 

@@ -1,9 +1,14 @@
 //! Hyperdrive 経由の DB 接続を測る probe。**HTTP のハンドラを持たず、定時実行だけ**で動き、
 //! 1 回の実行につき 1 行の JSON をログに出す (項目は README の「Hyperdrive の probe」)。
 //!
-//! - 読むのは `current_user`・`pg_roles` の自分の行・`current_setting` だけ。業務の表は読まない・書かない。
+//! - 読むのは `current_user`・`pg_roles` の自分の行・`current_setting`・`pg_backend_pid` と、渡した引数をそのまま返す文・
+//!   `pg_sleep` だけ (pid は種類の数を数えるだけで、値は出さない)。
+//!   業務の表は読まない・書かない。
 //! - **ログに出すのはロール名・真偽・回数・ms と、固定の label・SQLSTATE・`io::ErrorKind` の名前だけ。**
 //!   接続文字列・宛先・認証情報と、エラーの文 (`Display` / `Debug` / DB の message) は出さない ([`kind`])。
+//!   例外は kit の `ConnectError` の `Display` だけ (binding 名・段の固定の label・[`kind`] の語しか出さない作り)。
+//! - 既存の系列 (PoC) の後ろに、共通 crate `alc-worker-db` (ippoan/alc-worker-kit) をそのまま通す系列 ([`Kit`]) を流す
+//!   (Refs ippoan/rust-alc-api#723)。
 //! - [`EXPIRES_AT_MS`] を過ぎたら DB に繋がない。
 
 #![deny(
@@ -13,24 +18,30 @@
     clippy::indexing_slicing
 )]
 
-use std::cell::RefCell;
-use std::collections::BTreeMap;
-use std::error::Error as _;
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
+use alc_worker_db::{hyperdrive, kind, PgClient};
+use chrono::{DateTime, Utc};
+use futures_util::future::{join, join_all};
 use serde::Serialize;
-use tokio_postgres::types::Type;
+use tokio_postgres::types::{ToSql, Type};
 use tokio_postgres::{Client, Config, Error as PgError, SimpleQueryMessage};
+use uuid::Uuid;
 use worker::postgres_tls::PassthroughTls;
 use worker::{
     console_log, event, Date, Env, ScheduleContext, ScheduledEvent, SecureTransport, Socket,
 };
 
 const HD_BINDING: &str = "HD";
-/// 2026-10-05T00:00:00Z。これを過ぎた実行は DB に繋がずに終わる
-const EXPIRES_AT_MS: u64 = 1_791_158_400_000;
+/// wrangler.toml に無い binding 名 (kit の接続が「binding が無い」を `Ok(None)` で返すことを見る)
+const HD_ABSENT_BINDING: &str = "HD_ABSENT";
+/// 2026-10-09T00:00:00Z。これを過ぎた実行は DB に繋がずに終わる
+const EXPIRES_AT_MS: u64 = 1_791_504_000_000;
 const RUNTIME_ROLE: &str = "alc_api_rt";
 /// 系列ごとに接続を張り直す回数 (テナント A / B を交互に)。接続は合計 2 + 3 × 5 + 3 = 20 本
+/// (その後の kit の系列が、逐次に 2 本 + 並列に 6 本を足す)
 const ITERATIONS: u32 = 5;
 /// 対照系列 (Row を COMMIT の後まで持つ) の回数
 const CONTROL_ITERATIONS: u32 = 3;
@@ -40,22 +51,22 @@ const READ_TENANT: &str = "SELECT current_setting('app.current_tenant_id', true)
 const READ_SETTINGS: &str =
     "SELECT current_setting('app.current_tenant_id', true), current_setting('search_path')";
 const ECHO: &str = "SELECT $1::text AS v";
-
-/// tokio-postgres のエラーの種類。`Display` の先頭 (種類ごとに固定の文) → 固定の label
-const PG_KINDS: &[(&str, &str)] = &[
-    ("error communicating with the server", "io"),
-    ("unexpected message from server", "unexpected_message"),
-    ("error performing TLS handshake", "tls"),
-    ("error serializing parameter", "to_sql"),
-    ("error deserializing column", "from_sql"),
-    ("connection closed", "closed"),
-    ("error parsing response from server", "parse"),
-    ("error encoding message to server", "encode"),
-    ("authentication error", "authentication"),
-    ("invalid configuration", "config"),
-    ("error connecting to server", "connect"),
-    ("timeout waiting for server", "timeout"),
-];
+/// kit の並列の tx の中で読む文: テナント・search_path と、上流の接続 (DB 側の backend) の pid
+const KIT_READ_SETTINGS_AND_PID: &str = "SELECT current_setting('app.current_tenant_id', true), current_setting('search_path'), pg_backend_pid()";
+/// 並列の間、素の接続が transaction の外で読む文: テナントと、上流の接続の pid
+const READ_TENANT_AND_PID: &str =
+    "SELECT current_setting('app.current_tenant_id', true), pg_backend_pid()";
+/// kit の系列: 1 つの `PgClient` で `tenant_tx` を続けて流す回数 (テナント A / B を交互に)
+const KIT_SEQUENTIAL: u32 = 50;
+/// kit の系列の並列: kit の接続の本数 (偶数本目は A、奇数本目は B) と、各接続の `tenant_tx` の回数。
+/// 同時の接続は kit [`KIT_PARALLEL_CLIENTS`] 本 + 素 [`OUTSIDE_CLIENTS`] 本 = 6 本 (これ以上増やさない)
+const KIT_PARALLEL_CLIENTS: u32 = 4;
+const KIT_PARALLEL_TXS: u32 = 5;
+/// 並列の間、transaction の外で読み続ける素の接続の本数と、1 本あたりの読みの上限
+const OUTSIDE_CLIENTS: u32 = 2;
+const OUTSIDE_READS_MAX: u32 = 400;
+/// 並列の transaction を重ねるための待ち (50 ms)
+const SLEEP: &str = "SELECT pg_sleep(0.05)";
 
 /// 接続までの失敗の label (エラーの文は出さない)
 #[derive(Clone, Copy, Serialize)]
@@ -133,6 +144,93 @@ impl Series {
     }
 }
 
+/// 共通 crate `alc-worker-db` をそのまま通す系列 (接続は `hyperdrive::connect`、文は `tenant_tx` の中の型付きの文だけ)
+#[derive(Default, Serialize)]
+struct Kit {
+    /// テナント A と B が別の値か (乱数が取れず同じ値だと、並列の「自分の値」の比較が取り違えを検出できない)
+    tenants_distinct: bool,
+    /// binding 名を変えた呼び出し ([`HD_ABSENT_BINDING`]) が `Ok(None)` を返したか
+    absent_is_none: bool,
+    /// kit の接続を張れた本数 / 試した本数
+    connected: u32,
+    connect_attempts: u32,
+    /// kit の `current_user()` が実行用ロールか
+    is_runtime_role: Option<bool>,
+    /// 型: 渡した値がそのまま返った数 / 試した数 (uuid・timestamptz・text・text[]・int4 の 5 つ)
+    typed_echo_ok: u32,
+    typed_echo_total: u32,
+    /// `execute_typed` の行数: 真の条件 = 1、偽の条件 = 0 が返ったか
+    rows_affected_one: Option<bool>,
+    rows_affected_zero: Option<bool>,
+    /// 1 つの `PgClient` で `tenant_tx` を続けて 50 回: 成功した数・tx の中の値が渡した tenant と一致した数
+    sequential_ok: u32,
+    sequential_held: u32,
+    /// 並列: kit の接続 4 本 × 各 5 tx。成功した数・自分の値と一致した数・search_path が alc_api だった数
+    parallel_tx_total: u32,
+    parallel_tx_ok: u32,
+    parallel_held: u32,
+    parallel_search_path_held: u32,
+    /// 並列の間、素の接続 2 本が tx の外で読んだ回数と、値が見えた回数 (0 でなければ漏れ)
+    outside_reads: u32,
+    leak_outside_tx: u32,
+    /// 上流の接続 (DB 側の backend) を共有したか: 並列の kit の tx が使った pid の種類の数・素の読みが見た pid の
+    /// 種類の数・素の読みのうち、kit の tx が既に使った pid の上だった回数 (0 なら、この測り方では漏れを観測できない)。
+    /// pid の値は出さない
+    kit_backends: u32,
+    outside_backends: u32,
+    outside_reads_on_kit_backend: u32,
+    /// kit の系列の失敗 (step → 回数、kind → 回数)。step は固定の語だけ
+    failed_step: BTreeMap<&'static str, u32>,
+    errors_by_kind: BTreeMap<String, u32>,
+}
+
+impl Kit {
+    fn fail(&mut self, (step, kind): Failure) {
+        *self.failed_step.entry(step).or_insert(0) += 1;
+        *self.errors_by_kind.entry(kind).or_insert(0) += 1;
+    }
+
+    /// kit の接続を 1 本張る。失敗の kind は、binding が無ければ固定の語 `absent`、在るのに使えなければ
+    /// `ConnectError` の `Display` (`hyperdrive <binding 名>: <段>` か `…: handshake: <kind>` だけを出す作り。
+    /// 宛先・接続文字列・エラーの文は入らない)。`Debug` は使わない
+    async fn connect(&mut self, env: &Env) -> Option<PgClient> {
+        self.connect_attempts += 1;
+        let kind = match hyperdrive::connect(env, HD_BINDING).await {
+            Ok(Some(pg)) => {
+                self.connected += 1;
+                return Some(pg);
+            }
+            Ok(None) => "absent".to_owned(),
+            Err(e) => e.to_string(),
+        };
+        self.fail(("connect", kind));
+        None
+    }
+}
+
+/// 並列の kit の接続 1 本ぶんの集計
+#[derive(Default)]
+struct ParallelSeen {
+    ok: u32,
+    held: u32,
+    search_path_held: u32,
+    errors: Vec<String>,
+}
+
+/// 並列の間、素の接続 1 本が transaction の外で見たもの
+#[derive(Default)]
+struct OutsideSeen {
+    reads: u32,
+    leaks: u32,
+    /// この接続の読みが見た上流の pid
+    backends: BTreeSet<i32>,
+    on_kit_backend: u32,
+    error: Option<String>,
+}
+
+/// 並列の kit の tx が使った上流の接続 (DB 側の backend) の pid。数えるだけで、値は出さない
+type KitBackends = Rc<RefCell<BTreeSet<i32>>>;
+
 #[derive(Default, Serialize)]
 struct Timing {
     connect_p50: u64,
@@ -149,6 +247,7 @@ struct Report {
     tx_typed: Series,
     tx_named: Series,
     prepared_row_dropped_after_commit: Series,
+    kit: Kit,
     connection_task: BTreeMap<String, u32>,
     timing_ms: Timing,
     errors: Vec<Label>,
@@ -170,25 +269,6 @@ fn median(mut ms: Vec<u64>) -> u64 {
     ms.get(ms.len() / 2).copied().unwrap_or(0)
 }
 
-/// エラーを、識別子を含まない固定の語に落とす: DB のエラーは SQLSTATE、それ以外は tokio-postgres の
-/// 種類の label ([`PG_KINDS`]。当たらなければ `closed` / `other`)。原因が `io::Error` なら `:<ErrorKind の名前>` を足す。
-/// **`Display` の文は種類の判定に使うだけで、出さない。**
-fn kind(e: &PgError) -> String {
-    if let Some(db) = e.as_db_error() {
-        return db.code().code().to_owned();
-    }
-    let text = e.to_string();
-    let fallback = if e.is_closed() { "closed" } else { "other" };
-    let base = PG_KINDS
-        .iter()
-        .find(|(prefix, _)| text.starts_with(prefix))
-        .map_or(fallback, |(_, label)| label);
-    match e.source().and_then(|s| s.downcast_ref::<std::io::Error>()) {
-        Some(io) => format!("{base}:{:?}", io.kind()),
-        None => base.to_owned(),
-    }
-}
-
 fn outcome<T>(result: Result<T, PgError>) -> String {
     result.map_or_else(|e| kind(&e), |_| "ok".to_owned())
 }
@@ -199,19 +279,12 @@ fn at(step: &'static str) -> impl Fn(PgError) -> Failure {
 }
 
 /// 乱数の UUID (v4)。実在のテナントに当たらない値を `app.current_tenant_id` に入れるため。ログには出さない
-fn random_uuid() -> String {
+fn random_uuid() -> Uuid {
     let mut bytes = [0u8; 16];
     // 乱数が取れなければ 0 のまま (それでも v4 の形にはなる)
     let _ = getrandom::getrandom(&mut bytes);
     let n = (u128::from_be_bytes(bytes) & !(0xf << 76) & !(0x3 << 62)) | (0x4 << 76) | (0x2 << 62);
-    format!(
-        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
-        n >> 96,
-        (n >> 80) & 0xffff,
-        (n >> 64) & 0xffff,
-        (n >> 48) & 0xffff,
-        n & 0xffff_ffff_ffff
-    )
+    Uuid::from_u128(n)
 }
 
 /// `simple_query` (prepared statement を作らない経路) の最初の行を owned な列にする
@@ -365,9 +438,13 @@ async fn simple_tx(client: &Client, tenant: &str) -> Result<TxSeen, Failure> {
     Ok(seen(&settings, tenant, col(&rows, 0)))
 }
 
+/// `READ_TENANT` の結果に、空でない値が見えているか
+fn is_set(messages: &[SimpleQueryMessage]) -> bool {
+    col(&first_row(messages), 0).is_some_and(|v| !v.is_empty())
+}
+
 /// 1 接続ぶん: (i) 設定する前に見えないか → (ii) トランザクション → (iii) COMMIT の後に消えているか
 async fn iteration(client: &mut Client, mode: Mode, tenant: &str, s: &mut Series) -> Option<u64> {
-    let is_set = |m: &[SimpleQueryMessage]| col(&first_row(m), 0).is_some_and(|v| !v.is_empty());
     match client.simple_query(READ_TENANT).await {
         Ok(m) => s.leak_before_set += u32::from(is_set(&m)),
         Err(e) => return s.fail(at("read_before")(e)),
@@ -398,6 +475,126 @@ async fn iteration(client: &mut Client, mode: Mode, tenant: &str, s: &mut Series
         Err(e) => drop(s.fail(at("read_after")(e))),
     }
     Some(ms)
+}
+
+/// kit: 1 つの `tenant_tx` の中で、型付きの引数 5 つ (uuid・timestamptz・text・text[]・int4) を流し、
+/// 渡した値と同じ値が返った数を返す (`u32` は `TxOutput` ではないので `u64` で持ち出す)
+async fn kit_typed_echo(pg: &mut PgClient, tenant: Uuid) -> Result<u64, PgError> {
+    let id = random_uuid();
+    // DB の timestamptz はマイクロ秒までなので、渡す前に丸める
+    let at = DateTime::from_timestamp_micros(Utc::now().timestamp_micros()).unwrap_or_default();
+    let text = "probe".to_owned();
+    let list = vec!["a".to_owned(), "b c".to_owned()];
+    let number: i32 = -723;
+    pg.tenant_tx(tenant, move |tx| {
+        Box::pin(async move {
+            let mut same = 0;
+            let params: &[(&(dyn ToSql + Sync), Type)] = &[(&id, Type::UUID)];
+            let row = tx.query_typed_one("SELECT $1::uuid", params).await?;
+            same += u64::from(row.try_get(0).is_ok_and(|v: Uuid| v == id));
+            let params: &[(&(dyn ToSql + Sync), Type)] = &[(&at, Type::TIMESTAMPTZ)];
+            let row = tx.query_typed_one("SELECT $1::timestamptz", params).await?;
+            same += u64::from(row.try_get(0).is_ok_and(|v: DateTime<Utc>| v == at));
+            let params: &[(&(dyn ToSql + Sync), Type)] = &[(&text, Type::TEXT)];
+            let row = tx.query_typed_one("SELECT $1::text", params).await?;
+            same += u64::from(row.try_get(0).is_ok_and(|v: String| v == text));
+            let params: &[(&(dyn ToSql + Sync), Type)] = &[(&list, Type::TEXT_ARRAY)];
+            let row = tx.query_typed_one("SELECT $1::text[]", params).await?;
+            same += u64::from(row.try_get(0).is_ok_and(|v: Vec<String>| v == list));
+            let params: &[(&(dyn ToSql + Sync), Type)] = &[(&number, Type::INT4)];
+            let row = tx.query_typed_one("SELECT $1::int4", params).await?;
+            same += u64::from(row.try_get(0).is_ok_and(|v: i32| v == number));
+            Ok(same)
+        })
+    })
+    .await
+}
+
+/// kit: `execute_typed` の行数 (真の条件, 偽の条件)
+async fn kit_rows_affected(pg: &mut PgClient, tenant: Uuid) -> Result<(u64, u64), PgError> {
+    let id = random_uuid();
+    pg.tenant_tx(tenant, move |tx| {
+        Box::pin(async move {
+            let params: &[(&(dyn ToSql + Sync), Type)] = &[(&id, Type::UUID)];
+            let one = tx.execute_typed("SELECT 1 WHERE $1::uuid IS NOT NULL", params);
+            let one = one.await?;
+            let zero = tx.execute_typed("SELECT 1 WHERE $1::uuid IS NULL", params);
+            Ok((one, zero.await?))
+        })
+    })
+    .await
+}
+
+/// kit: 並列の接続 1 本ぶん。自分のテナントで `tenant_tx` を [`KIT_PARALLEL_TXS`] 回流し、
+/// 待ち ([`SLEEP`]) の後に tx の中の設定を読む (ほかの接続の tx と重なった状態で、自分の値が見えるか)。
+/// tx が使った上流の pid は、COMMIT の後に `backends` へ足す (閉包の中には `Rc` を持ち込まない)
+async fn kit_parallel(pg: Option<PgClient>, tenant: Uuid, backends: KitBackends) -> ParallelSeen {
+    let mut seen = ParallelSeen::default();
+    let Some(mut pg) = pg else {
+        return seen;
+    };
+    let expected = tenant.to_string();
+    for _ in 0..KIT_PARALLEL_TXS {
+        let settings = pg
+            .tenant_tx(tenant, |tx| {
+                Box::pin(async move {
+                    tx.query_typed(SLEEP, &[]).await?;
+                    let row = tx.query_typed_one(KIT_READ_SETTINGS_AND_PID, &[]).await?;
+                    let tenant: Option<String> = row.try_get(0)?;
+                    let search_path: Option<String> = row.try_get(1)?;
+                    let pid: i32 = row.try_get(2)?;
+                    Ok((tenant, search_path, pid))
+                })
+            })
+            .await;
+        match settings {
+            Ok((tenant, search_path, pid)) => {
+                if let Ok(mut backends) = backends.try_borrow_mut() {
+                    backends.insert(pid);
+                }
+                seen.ok += 1;
+                seen.held += u32::from(tenant.as_deref() == Some(expected.as_str()));
+                seen.search_path_held += u32::from(search_path.as_deref() == Some("alc_api"));
+            }
+            Err(e) => seen.errors.push(kind(&e)),
+        }
+    }
+    seen
+}
+
+/// 並列の間、素の接続 1 本で **transaction を張らずに** テナントの設定を読み続ける。
+/// 少なくとも 1 回は読み、`done` が立つか [`OUTSIDE_READS_MAX`] 回で止まる (読みの往復が間隔になる)。
+/// 読むたびに上流の pid も読み、kit の tx が既に使った pid の上だった回数を数える
+async fn outside_reads(
+    client: Option<Client>,
+    done: Rc<Cell<bool>>,
+    kit_backends: KitBackends,
+) -> OutsideSeen {
+    let mut seen = OutsideSeen::default();
+    let Some(client) = client else {
+        return seen;
+    };
+    while seen.reads < OUTSIDE_READS_MAX {
+        match client.simple_query(READ_TENANT_AND_PID).await {
+            Ok(m) => {
+                seen.reads += 1;
+                seen.leaks += u32::from(is_set(&m));
+                if let Some(pid) = col(&first_row(&m), 1).and_then(|v| v.parse::<i32>().ok()) {
+                    seen.backends.insert(pid);
+                    let on_kit = kit_backends.try_borrow().is_ok_and(|b| b.contains(&pid));
+                    seen.on_kit_backend += u32::from(on_kit);
+                }
+            }
+            Err(e) => {
+                seen.error = Some(kind(&e));
+                break;
+            }
+        }
+        if done.get() {
+            break;
+        }
+    }
+    seen
 }
 
 struct Probe<'a> {
@@ -452,8 +649,117 @@ impl Probe<'_> {
         s
     }
 
+    /// 共通 crate `alc-worker-db` をそのまま通す系列。途中で失敗しても、数えて次へ進む
+    async fn kit(&self, tenants: (Uuid, Uuid)) -> Kit {
+        let mut kit = Kit {
+            tenants_distinct: tenants.0 != tenants.1,
+            ..Kit::default()
+        };
+        // 3 状態のうち「binding が無い」: wrangler.toml に無い名前は Ok(None) (繋ぎに行かない)
+        match hyperdrive::connect(self.env, HD_ABSENT_BINDING).await {
+            Ok(pg) => kit.absent_is_none = pg.is_none(),
+            Err(e) => kit.fail(("absent", e.to_string())),
+        }
+        // 1 本目: ロール・型付きの引数・execute_typed の行数
+        if let Some(mut pg) = kit.connect(self.env).await {
+            match pg.current_user().await {
+                Ok(user) => kit.is_runtime_role = Some(user.as_deref() == Some(RUNTIME_ROLE)),
+                Err(e) => kit.fail(at("current_user")(e)),
+            }
+            kit.typed_echo_total = 5;
+            match kit_typed_echo(&mut pg, tenants.0).await {
+                Ok(same) => kit.typed_echo_ok = u32::try_from(same).unwrap_or(u32::MAX),
+                Err(e) => kit.fail(at("typed_echo")(e)),
+            }
+            match kit_rows_affected(&mut pg, tenants.0).await {
+                Ok((one, zero)) => {
+                    kit.rows_affected_one = Some(one == 1);
+                    kit.rows_affected_zero = Some(zero == 0);
+                }
+                Err(e) => kit.fail(at("rows_affected")(e)),
+            }
+        }
+        // 2 本目: 1 つの PgClient で tenant_tx を続けて流す (前の tx の値が次の tx に残らないか)
+        if let Some(mut pg) = kit.connect(self.env).await {
+            for i in 0..KIT_SEQUENTIAL {
+                let tenant = if i % 2 == 0 { tenants.0 } else { tenants.1 };
+                let seen = pg
+                    .tenant_tx(tenant, |tx| {
+                        Box::pin(async move {
+                            let row = tx.query_typed_one(READ_TENANT, &[]).await?;
+                            row.try_get::<_, Option<String>>(0)
+                        })
+                    })
+                    .await;
+                match seen {
+                    Ok(seen) => {
+                        kit.sequential_ok += 1;
+                        kit.sequential_held +=
+                            u32::from(seen.as_deref() == Some(tenant.to_string().as_str()));
+                    }
+                    Err(e) => kit.fail(at("sequential")(e)),
+                }
+            }
+        }
+        // 並列: 上の 2 本は閉じてから、kit の接続 4 本 + 素の接続 2 本を先に張り、6 本を同時に回す
+        kit.parallel_tx_total = KIT_PARALLEL_CLIENTS * KIT_PARALLEL_TXS;
+        let kit_backends = KitBackends::default();
+        let mut workers = Vec::new();
+        for i in 0..KIT_PARALLEL_CLIENTS {
+            let tenant = if i % 2 == 0 { tenants.0 } else { tenants.1 };
+            let pg = kit.connect(self.env).await;
+            workers.push(kit_parallel(pg, tenant, Rc::clone(&kit_backends)));
+        }
+        let done = Rc::new(Cell::new(false));
+        let mut readers = Vec::new();
+        for _ in 0..OUTSIDE_CLIENTS {
+            let client = connect(self.env, &self.task_errors).await;
+            if client.is_err() {
+                kit.fail(("outside_connect", "connect".to_owned()));
+            }
+            readers.push(outside_reads(
+                client.ok(),
+                Rc::clone(&done),
+                Rc::clone(&kit_backends),
+            ));
+        }
+        let workers = async {
+            let seen = join_all(workers).await;
+            // kit の 4 本が全部終わったら、外で読んでいる 2 本を止める
+            done.set(true);
+            seen
+        };
+        let (workers, readers) = join(workers, join_all(readers)).await;
+        for seen in workers {
+            kit.parallel_tx_ok += seen.ok;
+            kit.parallel_held += seen.held;
+            kit.parallel_search_path_held += seen.search_path_held;
+            for kind in seen.errors {
+                kit.fail(("parallel", kind));
+            }
+        }
+        let mut outside_backends = BTreeSet::new();
+        for seen in readers {
+            kit.outside_reads += seen.reads;
+            kit.leak_outside_tx += seen.leaks;
+            kit.outside_reads_on_kit_backend += seen.on_kit_backend;
+            outside_backends.extend(seen.backends);
+            if let Some(kind) = seen.error {
+                kit.fail(("outside_read", kind));
+            }
+        }
+        // pid は種類の数だけを出す (値は出さない)
+        let count = |pids: &BTreeSet<i32>| u32::try_from(pids.len()).unwrap_or(u32::MAX);
+        kit.outside_backends = count(&outside_backends);
+        if let Ok(backends) = kit_backends.try_borrow() {
+            kit.kit_backends = count(&backends);
+        }
+        kit
+    }
+
     async fn run(mut self) -> Report {
-        let (a, b) = (random_uuid(), random_uuid());
+        let (tenant_a, tenant_b) = (random_uuid(), random_uuid());
+        let (a, b) = (tenant_a.to_string(), tenant_b.to_string());
         let tenants = (a.as_str(), b.as_str());
         // 1 本目: ロール・往復の時間・単発の query_typed (どれも prepare の往復をしない)
         if let Some(mut client) = self.connect().await {
@@ -478,6 +784,8 @@ impl Probe<'_> {
         self.report.prepared_row_dropped_after_commit = self
             .series(Mode::RowDroppedAfterCommit, CONTROL_ITERATIONS, tenants)
             .await;
+        // 既存の系列 (PoC) の後に、共通 crate の系列。失敗しても上の項目はそのまま出る
+        self.report.kit = self.kit((tenant_a, tenant_b)).await;
         if let Ok(errors) = self.task_errors.try_borrow() {
             self.report.connection_task = errors.clone();
         }
