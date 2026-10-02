@@ -14,11 +14,20 @@ crate-type = ["cdylib"]
 [workspace]
 
 [dependencies]
+# 分割 worker の共通の DB の部品 (PgClient・tenant_tx・kind・hyperdrive::connect)。kit の系列がこれを Hyperdrive 越しに通す
+# (Refs ippoan/rust-alc-api#723)。rev は ippoan/alc-worker-kit の main の commit
+alc-worker-db = { git = "https://github.com/ippoan/alc-worker-kit", rev = "6e8b169846e068a93fa367f963a578b7422f5db8", features = ["chrono"] }
+# kit の系列の TIMESTAMPTZ の引数 (clock + wasmbind で Utc::now が JS の Date を読む)
+chrono = { version = "0.4", default-features = false, features = ["clock", "wasmbind"] }
+# kit の系列の並列 (join_all・join)
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # テナントの代わりに使う乱数の UUID を crypto.getRandomValues から作る
 getrandom = { version = "0.2", features = ["js"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio-postgres = { version = "0.7", default-features = false, features = ["js"] }
+# with-uuid-1・with-chrono-0_4 は kit の系列が Type::UUID・Type::TIMESTAMPTZ の引数を渡すため
+tokio-postgres = { version = "0.7", default-features = false, features = ["js", "with-chrono-0_4", "with-uuid-1"] }
+uuid = { version = "1", features = ["js"] }
 wasm-bindgen-futures = "0.4"
 # worker-build (CI と wrangler.toml の [build]) と同じ 0.8.7 に固定する。
 # feature tokio-postgres は Socket の StartTls を tokio-postgres に渡す PassthroughTls のため
