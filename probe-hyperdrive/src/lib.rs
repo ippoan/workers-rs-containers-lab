@@ -1,7 +1,8 @@
 //! Hyperdrive 経由の DB 接続を測る probe。**HTTP のハンドラを持たず、定時実行だけ**で動き、
 //! 1 回の実行につき 1 行の JSON をログに出す (項目は README の「Hyperdrive の probe」)。
 //!
-//! - 読むのは `current_user`・`pg_roles` の自分の行・`current_setting` と、渡した引数をそのまま返す文・`pg_sleep` だけ。
+//! - 読むのは `current_user`・`pg_roles` の自分の行・`current_setting`・`pg_backend_pid` と、渡した引数をそのまま返す文・
+//!   `pg_sleep` だけ (pid は種類の数を数えるだけで、値は出さない)。
 //!   業務の表は読まない・書かない。
 //! - **ログに出すのはロール名・真偽・回数・ms と、固定の label・SQLSTATE・`io::ErrorKind` の名前だけ。**
 //!   接続文字列・宛先・認証情報と、エラーの文 (`Display` / `Debug` / DB の message) は出さない ([`kind`])。
@@ -18,7 +19,7 @@
 )]
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use alc_worker_db::{hyperdrive, kind, PgClient};
@@ -50,6 +51,11 @@ const READ_TENANT: &str = "SELECT current_setting('app.current_tenant_id', true)
 const READ_SETTINGS: &str =
     "SELECT current_setting('app.current_tenant_id', true), current_setting('search_path')";
 const ECHO: &str = "SELECT $1::text AS v";
+/// kit の並列の tx の中で読む文: テナント・search_path と、上流の接続 (DB 側の backend) の pid
+const KIT_READ_SETTINGS_AND_PID: &str = "SELECT current_setting('app.current_tenant_id', true), current_setting('search_path'), pg_backend_pid()";
+/// 並列の間、素の接続が transaction の外で読む文: テナントと、上流の接続の pid
+const READ_TENANT_AND_PID: &str =
+    "SELECT current_setting('app.current_tenant_id', true), pg_backend_pid()";
 /// kit の系列: 1 つの `PgClient` で `tenant_tx` を続けて流す回数 (テナント A / B を交互に)
 const KIT_SEQUENTIAL: u32 = 50;
 /// kit の系列の並列: kit の接続の本数 (偶数本目は A、奇数本目は B) と、各接続の `tenant_tx` の回数。
@@ -141,6 +147,8 @@ impl Series {
 /// 共通 crate `alc-worker-db` をそのまま通す系列 (接続は `hyperdrive::connect`、文は `tenant_tx` の中の型付きの文だけ)
 #[derive(Default, Serialize)]
 struct Kit {
+    /// テナント A と B が別の値か (乱数が取れず同じ値だと、並列の「自分の値」の比較が取り違えを検出できない)
+    tenants_distinct: bool,
     /// binding 名を変えた呼び出し ([`HD_ABSENT_BINDING`]) が `Ok(None)` を返したか
     absent_is_none: bool,
     /// kit の接続を張れた本数 / 試した本数
@@ -165,6 +173,12 @@ struct Kit {
     /// 並列の間、素の接続 2 本が tx の外で読んだ回数と、値が見えた回数 (0 でなければ漏れ)
     outside_reads: u32,
     leak_outside_tx: u32,
+    /// 上流の接続 (DB 側の backend) を共有したか: 並列の kit の tx が使った pid の種類の数・素の読みが見た pid の
+    /// 種類の数・素の読みのうち、kit の tx が既に使った pid の上だった回数 (0 なら、この測り方では漏れを観測できない)。
+    /// pid の値は出さない
+    kit_backends: u32,
+    outside_backends: u32,
+    outside_reads_on_kit_backend: u32,
     /// kit の系列の失敗 (step → 回数、kind → 回数)。step は固定の語だけ
     failed_step: BTreeMap<&'static str, u32>,
     errors_by_kind: BTreeMap<String, u32>,
@@ -208,8 +222,14 @@ struct ParallelSeen {
 struct OutsideSeen {
     reads: u32,
     leaks: u32,
+    /// この接続の読みが見た上流の pid
+    backends: BTreeSet<i32>,
+    on_kit_backend: u32,
     error: Option<String>,
 }
+
+/// 並列の kit の tx が使った上流の接続 (DB 側の backend) の pid。数えるだけで、値は出さない
+type KitBackends = Rc<RefCell<BTreeSet<i32>>>;
 
 #[derive(Default, Serialize)]
 struct Timing {
@@ -506,8 +526,9 @@ async fn kit_rows_affected(pg: &mut PgClient, tenant: Uuid) -> Result<(u64, u64)
 }
 
 /// kit: 並列の接続 1 本ぶん。自分のテナントで `tenant_tx` を [`KIT_PARALLEL_TXS`] 回流し、
-/// 待ち ([`SLEEP`]) の後に tx の中の設定を読む (ほかの接続の tx と重なった状態で、自分の値が見えるか)
-async fn kit_parallel(pg: Option<PgClient>, tenant: Uuid) -> ParallelSeen {
+/// 待ち ([`SLEEP`]) の後に tx の中の設定を読む (ほかの接続の tx と重なった状態で、自分の値が見えるか)。
+/// tx が使った上流の pid は、COMMIT の後に `backends` へ足す (閉包の中には `Rc` を持ち込まない)
+async fn kit_parallel(pg: Option<PgClient>, tenant: Uuid, backends: KitBackends) -> ParallelSeen {
     let mut seen = ParallelSeen::default();
     let Some(mut pg) = pg else {
         return seen;
@@ -518,15 +539,19 @@ async fn kit_parallel(pg: Option<PgClient>, tenant: Uuid) -> ParallelSeen {
             .tenant_tx(tenant, |tx| {
                 Box::pin(async move {
                     tx.query_typed(SLEEP, &[]).await?;
-                    let row = tx.query_typed_one(READ_SETTINGS, &[]).await?;
+                    let row = tx.query_typed_one(KIT_READ_SETTINGS_AND_PID, &[]).await?;
                     let tenant: Option<String> = row.try_get(0)?;
                     let search_path: Option<String> = row.try_get(1)?;
-                    Ok((tenant, search_path))
+                    let pid: i32 = row.try_get(2)?;
+                    Ok((tenant, search_path, pid))
                 })
             })
             .await;
         match settings {
-            Ok((tenant, search_path)) => {
+            Ok((tenant, search_path, pid)) => {
+                if let Ok(mut backends) = backends.try_borrow_mut() {
+                    backends.insert(pid);
+                }
                 seen.ok += 1;
                 seen.held += u32::from(tenant.as_deref() == Some(expected.as_str()));
                 seen.search_path_held += u32::from(search_path.as_deref() == Some("alc_api"));
@@ -538,17 +563,27 @@ async fn kit_parallel(pg: Option<PgClient>, tenant: Uuid) -> ParallelSeen {
 }
 
 /// 並列の間、素の接続 1 本で **transaction を張らずに** テナントの設定を読み続ける。
-/// 少なくとも 1 回は読み、`done` が立つか [`OUTSIDE_READS_MAX`] 回で止まる (読みの往復が間隔になる)
-async fn outside_reads(client: Option<Client>, done: Rc<Cell<bool>>) -> OutsideSeen {
+/// 少なくとも 1 回は読み、`done` が立つか [`OUTSIDE_READS_MAX`] 回で止まる (読みの往復が間隔になる)。
+/// 読むたびに上流の pid も読み、kit の tx が既に使った pid の上だった回数を数える
+async fn outside_reads(
+    client: Option<Client>,
+    done: Rc<Cell<bool>>,
+    kit_backends: KitBackends,
+) -> OutsideSeen {
     let mut seen = OutsideSeen::default();
     let Some(client) = client else {
         return seen;
     };
     while seen.reads < OUTSIDE_READS_MAX {
-        match client.simple_query(READ_TENANT).await {
+        match client.simple_query(READ_TENANT_AND_PID).await {
             Ok(m) => {
                 seen.reads += 1;
                 seen.leaks += u32::from(is_set(&m));
+                if let Some(pid) = col(&first_row(&m), 1).and_then(|v| v.parse::<i32>().ok()) {
+                    seen.backends.insert(pid);
+                    let on_kit = kit_backends.try_borrow().is_ok_and(|b| b.contains(&pid));
+                    seen.on_kit_backend += u32::from(on_kit);
+                }
             }
             Err(e) => {
                 seen.error = Some(kind(&e));
@@ -616,7 +651,10 @@ impl Probe<'_> {
 
     /// 共通 crate `alc-worker-db` をそのまま通す系列。途中で失敗しても、数えて次へ進む
     async fn kit(&self, tenants: (Uuid, Uuid)) -> Kit {
-        let mut kit = Kit::default();
+        let mut kit = Kit {
+            tenants_distinct: tenants.0 != tenants.1,
+            ..Kit::default()
+        };
         // 3 状態のうち「binding が無い」: wrangler.toml に無い名前は Ok(None) (繋ぎに行かない)
         match hyperdrive::connect(self.env, HD_ABSENT_BINDING).await {
             Ok(pg) => kit.absent_is_none = pg.is_none(),
@@ -665,10 +703,12 @@ impl Probe<'_> {
         }
         // 並列: 上の 2 本は閉じてから、kit の接続 4 本 + 素の接続 2 本を先に張り、6 本を同時に回す
         kit.parallel_tx_total = KIT_PARALLEL_CLIENTS * KIT_PARALLEL_TXS;
+        let kit_backends = KitBackends::default();
         let mut workers = Vec::new();
         for i in 0..KIT_PARALLEL_CLIENTS {
             let tenant = if i % 2 == 0 { tenants.0 } else { tenants.1 };
-            workers.push(kit_parallel(kit.connect(self.env).await, tenant));
+            let pg = kit.connect(self.env).await;
+            workers.push(kit_parallel(pg, tenant, Rc::clone(&kit_backends)));
         }
         let done = Rc::new(Cell::new(false));
         let mut readers = Vec::new();
@@ -677,7 +717,11 @@ impl Probe<'_> {
             if client.is_err() {
                 kit.fail(("outside_connect", "connect".to_owned()));
             }
-            readers.push(outside_reads(client.ok(), Rc::clone(&done)));
+            readers.push(outside_reads(
+                client.ok(),
+                Rc::clone(&done),
+                Rc::clone(&kit_backends),
+            ));
         }
         let workers = async {
             let seen = join_all(workers).await;
@@ -694,12 +738,21 @@ impl Probe<'_> {
                 kit.fail(("parallel", kind));
             }
         }
+        let mut outside_backends = BTreeSet::new();
         for seen in readers {
             kit.outside_reads += seen.reads;
             kit.leak_outside_tx += seen.leaks;
+            kit.outside_reads_on_kit_backend += seen.on_kit_backend;
+            outside_backends.extend(seen.backends);
             if let Some(kind) = seen.error {
                 kit.fail(("outside_read", kind));
             }
+        }
+        // pid は種類の数だけを出す (値は出さない)
+        let count = |pids: &BTreeSet<i32>| u32::try_from(pids.len()).unwrap_or(u32::MAX);
+        kit.outside_backends = count(&outside_backends);
+        if let Ok(backends) = kit_backends.try_borrow() {
+            kit.kit_backends = count(&backends);
         }
         kit
     }
