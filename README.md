@@ -236,12 +236,18 @@ Workers の TCP の代わりに **Cloudflare Hyperdrive 経由**で DB に繋ぐ
 **Hyperdrive 経由では、トランザクションの中の引数付きの文は `query_typed` か simple query で書く。
 tokio-postgres の `query` / `execute` (名前付き prepared statement) は使えない。**
 
+**遅かったのは Hyperdrive ではなく worker の実行場所。Placement は fetch で呼ばれる worker には効き、
+定時実行と `wrangler dev --remote` には効かなかった。** 速度を測るときは fetch で呼ぶこと。
+
+HTTP の値は、GET だけ受ける fetch ハンドラを一時的に足した版を、Access で守った staging の workers.dev に配信して測った
+(その版は repo に入れていない。測定後に worker と Access の設定は削除)。
+
 | 問い | 結果 |
 |---|---|
 | Q2 接続 | 公式例の形で繋がる。接続 2〜5 ms |
-| Q4 トランザクション単位の設定 | `tx_simple` 5/5・`tx_typed` 5/5 で、`app.current_tenant_id` と `search_path` がトランザクションの中で保たれ、COMMIT の後は空、張り直した次の接続に前の値は見えない (leak 0)。4 回の実行すべてで同じ |
-| Q5 問い合わせの流し方 | `simple_query` / `batch_execute` だけ: 通る (5/5)<br>`query_typed` (名前なし・1 往復): 通る (5/5)<br>名前付き prepared statement (`tx.execute` / `tx.query`) をトランザクションの中で: **0/5**。`set_config` の step で `unexpected_message`、またはその次の文で `closed`<br>トランザクションの外の単発: `query_typed` は ok。名前付きは回によって ok / `unexpected_message`<br>Hyperdrive の caching の有効・無効で結果は変わらなかった |
-| Q6 所要時間 (ms、参考値) | 1 文の往復の平均: `wrangler dev --remote` (手元の近くの拠点) で 71.7 / 72.95 / 84.75 / 122.85、定時実行で 237〜252<br>1 トランザクション (6 文前後): remote で 525〜587、定時実行で 1438〜1520<br>**`[env.staging.placement]` を入れても定時実行の値は変わらなかった (244)**。fetch で動く worker での値は測っていない |
+| Q4 トランザクション単位の設定 | `tx_simple` 5/5・`tx_typed` 5/5 で、`app.current_tenant_id` と `search_path` がトランザクションの中で保たれ、COMMIT の後は空、張り直した次の接続に前の値は見えない (leak 0)。4 回の実行すべてで同じ。HTTP での 3 回も同じ結果 (simple・`query_typed` は 5/5・leak 0) |
+| Q5 問い合わせの流し方 | `simple_query` / `batch_execute` だけ: 通る (5/5)<br>`query_typed` (名前なし・1 往復): 通る (5/5)<br>名前付き prepared statement (`tx.execute` / `tx.query`) をトランザクションの中で: **0/5**。`set_config` の step で `unexpected_message`、またはその次の文で `closed`<br>トランザクションの外の単発: `query_typed` は ok。名前付きは回によって ok / `unexpected_message`<br>Hyperdrive の caching の有効・無効で結果は変わらなかった<br>HTTP での 3 回も同じ結果 (simple・`query_typed` は 5/5・leak 0、名前付きは 0/5) |
+| Q6 所要時間 (ms、参考値) | 1 文の往復の平均: `wrangler dev --remote` (手元の近くの拠点) で 71.7 / 72.95 / 84.75 / 122.85、定時実行で 237〜252<br>1 トランザクション (6 文前後): remote で 525〜587、定時実行で 1438〜1520<br>**`[env.staging.placement]` を入れても定時実行の値は変わらなかった (244)**<br>**HTTP (fetch) で呼ばれる worker + `placement.region`** では、1 文の往復の平均がトランザクションの中で 4.45 / 5.15 / 5.55、外で 2.8 / 3.15 / 3.8。1 トランザクション (6 文前後) は 20〜37。probe 全体 (接続 20 本) で応答 1.1〜1.3 秒。応答ヘッダ `cf-placement` は `remote-NRT` (入口は KIX / NRT) |
 
 ## 構成
 

@@ -26,7 +26,7 @@ preview_urls = false
 enabled = true
 
 # Placement Hints: worker-unknown と同じく、worker を DB の近く (AWS 東京リージョンの近く) で動かす指定。
-# 定時実行では効かなかった (実測。1 文の往復の時間は変わらなかった)。fetch では未測定。staging だけ
+# 定時実行と dev --remote では効かなかった。fetch で呼ぶ版では効いた (README の結果)。staging だけ
 [env.staging.placement]
 region = "aws:ap-northeast-1"
 
