@@ -4,6 +4,7 @@
 # デプロイ直後に「token 無しでは Access に止められる」ことを確かめる。
 # probe (probe-unknown / probe-emscripten: ZIP・署名・PDF がターゲットごとに動くか) は DB を使わないので、
 # 上とは独立に、自分の build が通ったら並列にデプロイする。README 参照。
+# probe-hyperdrive (Hyperdrive 経由の DB 接続を測る。定時実行だけ) は検査と build まで。CI からは配信しない (手動)。
 name: CI
 
 on:
@@ -30,7 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: 外から直接届かないことの検査
-        run: bash scripts/check-exposure.sh worker-unknown/wrangler.toml worker-emscripten/wrangler.toml probe-unknown/wrangler.toml probe-emscripten/wrangler.toml --private lab-db/wrangler.toml
+        run: bash scripts/check-exposure.sh worker-unknown/wrangler.toml worker-emscripten/wrangler.toml probe-unknown/wrangler.toml probe-emscripten/wrangler.toml --private lab-db/wrangler.toml --private probe-hyperdrive/wrangler.toml
       - name: check-exposure.sh の陰性対照
         run: bash scripts/check-exposure-test.sh worker-unknown/wrangler.toml
       - name: check-exposure.sh の陰性対照 (worker-emscripten)
@@ -41,6 +42,8 @@ jobs:
         run: bash scripts/check-exposure-test.sh probe-emscripten/wrangler.toml
       - name: check-exposure.sh の陰性対照 (lab-db、--private)
         run: bash scripts/check-exposure-test.sh --private lab-db/wrangler.toml
+      - name: check-exposure.sh の陰性対照 (probe-hyperdrive、--private)
+        run: bash scripts/check-exposure-test.sh --private probe-hyperdrive/wrangler.toml
 
   # Container (postgres + PgBouncer transaction mode) が空の DB から立ち上がり、
   # superuser ではない bench で items (1000 行) が読めること
@@ -197,6 +200,34 @@ jobs:
           line="probe-emscripten glue: raw=$(stat -c%s build/index.js) B / gzip=$(gzip -9c build/index.js | wc -c) B"
           echo "$line"
           echo "$line" >>"$GITHUB_STEP_SUMMARY"
+
+  # Hyperdrive 経由の DB 接続を測る probe (wasm32-unknown-unknown)。HTTP のハンドラを持たず、定時実行だけ。
+  # build まで (配信は手動で、CI からはしない。デプロイの job は無い)
+  probe-hyperdrive:
+    name: probe-hyperdrive (wasm32-unknown-unknown)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: probe-hyperdrive
+    steps:
+      - uses: actions/checkout@v4
+      # 版は probe-hyperdrive/rust-toolchain.toml と揃える
+      - uses: dtolnay/rust-toolchain@1.92.0
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+      - uses: swatinem/rust-cache@v2
+        with:
+          shared-key: probe-hyperdrive
+          workspaces: probe-hyperdrive
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo fmt --check
+      - run: cargo clippy --target wasm32-unknown-unknown -- -D warnings
+      # worker-build の版は wrangler.toml の [build] command と Cargo.toml の worker と揃える
+      - run: cargo install -q worker-build@0.8.7 --locked
+      - run: worker-build --release
+      - name: bundle サイズ (上限は圧縮前 64 MiB)
+        run: bash ../bench/bundle-size.sh probe-hyperdrive build/index_bg.wasm
 
   # DO LabDb と Container を持つスクリプト (A・B が script_name で参照する)
   lab-db:
@@ -600,8 +631,8 @@ jobs:
   # deploy-staging-* は main への push 限定なので、PR の merge を gate しない (deploy_gate_ignore)
   auto-merge:
     name: Auto Merge
-    needs: [exposure, container, lab-db, worker-unknown, worker-emscripten, probe-unknown, probe-emscripten]
-    if: github.event_name == 'pull_request' && needs.exposure.result == 'success' && needs.container.result == 'success' && needs.lab-db.result == 'success' && needs.worker-unknown.result == 'success' && needs.worker-emscripten.result == 'success' && needs.probe-unknown.result == 'success' && needs.probe-emscripten.result == 'success'
+    needs: [exposure, container, lab-db, worker-unknown, worker-emscripten, probe-unknown, probe-emscripten, probe-hyperdrive]
+    if: github.event_name == 'pull_request' && needs.exposure.result == 'success' && needs.container.result == 'success' && needs.lab-db.result == 'success' && needs.worker-unknown.result == 'success' && needs.worker-emscripten.result == 'success' && needs.probe-unknown.result == 'success' && needs.probe-emscripten.result == 'success' && needs.probe-hyperdrive.result == 'success'
     uses: ippoan/ci-workflows/.github/workflows/auto-merge.yml@main
     with:
       deploy_gate_ignore: deploy-staging-db,deploy-staging,deploy-staging-emscripten,deploy-staging-probe-unknown,deploy-staging-probe-emscripten

@@ -1,0 +1,30 @@
+# Hyperdrive 経由の DB 接続を測る probe (wasm32-unknown-unknown)。HTTP のハンドラを持たず、定時実行だけ。
+# workers-rs + tokio-postgres の組で、接続・ロール・トランザクション単位の設定・問い合わせの流し方ごとの可否・
+# 所要時間を 1 行の JSON でログに出す (Refs ippoan/rust-alc-api#725)。
+# ほかの worker の bundle を汚さないよう、自前の Cargo.lock を持つ独立 workspace。
+[package]
+name = "probe-hyperdrive"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[workspace]
+
+[dependencies]
+# テナントの代わりに使う乱数の UUID を crypto.getRandomValues から作る
+getrandom = { version = "0.2", features = ["js"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio-postgres = { version = "0.7", default-features = false, features = ["js"] }
+wasm-bindgen-futures = "0.4"
+# worker-build (CI と wrangler.toml の [build]) と同じ 0.8.7 に固定する。
+# feature tokio-postgres は Socket の StartTls を tokio-postgres に渡す PassthroughTls のため
+worker = { version = "=0.8.7", features = ["tokio-postgres"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1

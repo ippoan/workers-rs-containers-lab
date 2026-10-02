@@ -190,6 +190,65 @@ worker-build 0.8.7 --release (wasm-opt 後)。gzip は `gzip -9`。
   中間物を捨てるだけでは足りない (行を持たずに DB へ流す形が要る)
 - staging の値 (128 MB を超えたときの 5xx を含む) は bench/probe.mjs で取る
 
+## Hyperdrive の probe (`probe-hyperdrive/`)
+
+Workers の TCP の代わりに **Cloudflare Hyperdrive 経由**で DB に繋ぐ形を、workers-rs 0.8.7 + tokio-postgres の組で確かめる
+(Refs ippoan/rust-alc-api#725 / ippoan/rust-alc-api#723)。
+
+- **外から届く口が無い**: HTTP のハンドラを持たず、定時実行 (1 分ごと) だけ。`workers_dev` / `preview_urls` はどの env も false、
+  route 無し (`check-exposure.sh --private`)。DB の宛先は Hyperdrive の設定が決め、repo に在るのは設定の ID だけ
+- 読むのは `current_user`・`pg_roles` の自分の行・`current_setting` だけ (業務の表は読まない・書かない)
+- 期限: `src/lib.rs` の `EXPIRES_AT_MS` (2026-10-05T00:00:00Z) を過ぎた実行は、DB に繋がず `{"probe":"hyperdrive","expired":true}` だけ出す
+
+### 動かし方
+
+1. **配信せずに動かす (第一の手段)**: `cd probe-hyperdrive && npx wrangler@latest dev --remote --env staging --test-scheduled --port <port>`
+   を立て、`curl "http://127.0.0.1:<port>/__scheduled"` で 1 回動かす。Hyperdrive の実物を通る。1 回 13〜19 秒で、
+   結果の JSON は wrangler dev の出力に出る
+   - wrangler 4.58.0 では `Could not create remote preview session` で立たず、最新 (4.147 系) で立った
+   - ローカルの `wrangler dev` (`--remote` なし) は Hyperdrive を通らない
+2. **配信して定時実行で動かす (第二の手段。CI は build までで、配信は手動)**: `wrangler deploy --env staging` の後、
+   `wrangler tail --env staging --format json` の `logs[].message` を読む。片付けは `wrangler delete --env staging`
+   - 定時実行の間隔を変えて再配信しても、反映まで前の間隔で動き続けた
+   - 再配信すると、張ってあった tail に新しい版のイベントが来ないので張り直す
+
+### ログの読み方
+
+1 回の実行 (接続は逐次に 20 本) で 1 行の JSON:
+
+| 問い | 中身 | JSON の項目 |
+|---|---|---|
+| Q2 | 公式例の形 (`env.hyperdrive` → `Socket` の StartTls → `connect_raw(socket, PassthroughTls)`) で繋がるか | `connect` (1 本目)・`errors` (接続までの失敗の label) |
+| Q3 | 接続のロール | `role` |
+| Q4 | トランザクション単位の設定 (`set_config(…, true)`) が、中では効き (`held_in_tx`・`search_path_held`)・COMMIT で消え (`empty_after_commit`)・設定する前に見えない (`leak_before_set` = 0) か | 下の 3 系列それぞれ (接続を張り直して各 5 回) |
+| Q5 | 問い合わせの流し方ごとの可否。`tx_simple`: BEGIN から COMMIT まで simple query / `tx_typed`: `query_typed` (名前なしの statement) / `tx_named`: `execute`・`query` (名前付き prepared statement)。対照 (3 回、最後) は `tx_named` の形で `Row` を COMMIT の後まで持つ | `tx_simple` / `tx_typed` / `tx_named` / `prepared_row_dropped_after_commit`、トランザクションの外の単発は `single.typed` / `single.named` |
+| Q6 | 接続・1 トランザクションの中央値と、1 トランザクションの中の `SELECT 1` 20 回の 1 文あたりの平均 (`Date.now` の差。参考値) | `timing_ms`・各系列の `tx_p50` |
+
+- 系列の失敗は `failed_step` (`begin` / `set_config` / `read_setting` / `query` / `execute` / `commit` ほか) と `errors_by_kind` に数える。
+  接続の task が Err で終わった回数は `connection_task` (同じ形の 1 行 `{"probe":"hyperdrive","error":"connection_task","kind":…}` も出る)
+- エラーの種類 (kind) は、DB のエラーなら SQLSTATE、それ以外は固定の label (`io` / `unexpected_message` / `closed` / `parse` / `other` など。
+  原因が io エラーなら `:<ErrorKind の名前>` が付く)。**エラーの文は出さない**
+
+### 結果
+
+2026-10-02 の実測 (worker 0.8.7 + tokio-postgres 0.7.18。接続 20 本を逐次)。
+
+**Hyperdrive 経由では、トランザクションの中の引数付きの文は `query_typed` か simple query で書く。
+tokio-postgres の `query` / `execute` (名前付き prepared statement) は使えない。**
+
+**遅かったのは Hyperdrive ではなく worker の実行場所。Placement は fetch で呼ばれる worker には効き、
+定時実行と `wrangler dev --remote` には効かなかった。** 速度を測るときは fetch で呼ぶこと。
+
+HTTP の値は、GET だけ受ける fetch ハンドラを一時的に足した版を、Access で守った staging の workers.dev に配信して測った
+(その版は repo に入れていない。測定後に worker と Access の設定は削除)。
+
+| 問い | 結果 |
+|---|---|
+| Q2 接続 | 公式例の形で繋がる。接続 2〜5 ms |
+| Q4 トランザクション単位の設定 | `tx_simple` 5/5・`tx_typed` 5/5 で、`app.current_tenant_id` と `search_path` がトランザクションの中で保たれ、COMMIT の後は空、張り直した次の接続に前の値は見えない (leak 0)。4 回の実行すべてで同じ。HTTP での 3 回も同じ結果 (simple・`query_typed` は 5/5・leak 0) |
+| Q5 問い合わせの流し方 | `simple_query` / `batch_execute` だけ: 通る (5/5)<br>`query_typed` (名前なし・1 往復): 通る (5/5)<br>名前付き prepared statement (`tx.execute` / `tx.query`) をトランザクションの中で: **0/5**。`set_config` の step で `unexpected_message`、またはその次の文で `closed`<br>トランザクションの外の単発: `query_typed` は ok。名前付きは回によって ok / `unexpected_message`<br>Hyperdrive の caching の有効・無効で結果は変わらなかった<br>HTTP での 3 回も同じ結果 (simple・`query_typed` は 5/5・leak 0、名前付きは 0/5) |
+| Q6 所要時間 (ms、参考値) | 1 文の往復の平均: `wrangler dev --remote` (手元の近くの拠点) で 71.7 / 72.95 / 84.75 / 122.85、定時実行で 237〜252<br>1 トランザクション (6 文前後): remote で 525〜587、定時実行で 1438〜1520<br>**`[env.staging.placement]` を入れても定時実行の値は変わらなかった (244)**<br>**HTTP (fetch) で呼ばれる worker + `placement.region`** では、1 文の往復の平均がトランザクションの中で 4.45 / 5.15 / 5.55、外で 2.8 / 3.15 / 3.8。1 トランザクション (6 文前後) は 20〜37。probe 全体 (接続 20 本) で応答 1.1〜1.3 秒。応答ヘッダ `cf-placement` は `remote-NRT` (入口は KIX / NRT) |
+
 ## 構成
 
 ```
@@ -208,6 +267,7 @@ worker-emscripten/  (B) 独立 Cargo workspace (toolchain beta-2026-09-20、targ
   src/db.rs         A の src/db.rs の移植。A と同じく script_name で lab-db の LabDb を参照する
 probe-unknown/      独立 Cargo workspace (toolchain 1.92.0)。GET /zip・/sign・/pdf (下の probe-shared を読む)。/zip の mode=flush (R2) はここだけ
 probe-emscripten/   独立 Cargo workspace (toolchain beta-2026-09-20)。同じ口。ring と pdf は feature で外す
+probe-hyperdrive/   独立 Cargo workspace (toolchain 1.92.0)。Hyperdrive 経由の DB 接続を測る。HTTP の口は無く、定時実行だけ (配信は手動)
 probe-shared/       probe の処理 (zip_probe.rs / sign.rs / pdf.rs / mem.rs / probe.rs) と fonts/ (NotoSansJP + OFL)
 scripts/            check-exposure.sh (wrangler.toml の公開範囲の検査) と陰性対照
 bench/              bundle-size.sh / measure.mjs / probe.mjs
