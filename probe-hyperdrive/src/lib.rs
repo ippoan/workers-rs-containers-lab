@@ -2,8 +2,8 @@
 //! 1 回の実行につき 1 行の JSON をログに出す (項目は README の「Hyperdrive の probe」)。
 //!
 //! - 読むのは `current_user`・`pg_roles` の自分の行・`current_setting` だけ。業務の表は読まない・書かない。
-//! - **ログに出すのはロール名・真偽・回数・SQLSTATE・ms・固定の label だけ。** 接続文字列・宛先・認証情報と、
-//!   エラーの文 (`Display` / `Debug` / DB の message) は出さない。失敗は [`Label`] と SQLSTATE にだけ落とす。
+//! - **ログに出すのはロール名・真偽・回数・ms と、固定の label・SQLSTATE・`io::ErrorKind` の名前だけ。**
+//!   接続文字列・宛先・認証情報と、エラーの文 (`Display` / `Debug` / DB の message) は出さない ([`kind`])。
 //! - [`EXPIRES_AT_MS`] を過ぎたら DB に繋がない。
 
 #![deny(
@@ -13,11 +13,13 @@
     clippy::indexing_slicing
 )]
 
-use std::cell::Cell;
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::error::Error as _;
 use std::rc::Rc;
 
 use serde::Serialize;
+use tokio_postgres::types::Type;
 use tokio_postgres::{Client, Config, Error as PgError, SimpleQueryMessage};
 use worker::postgres_tls::PassthroughTls;
 use worker::{
@@ -28,14 +30,34 @@ const HD_BINDING: &str = "HD";
 /// 2026-10-05T00:00:00Z。これを過ぎた実行は DB に繋がずに終わる
 const EXPIRES_AT_MS: u64 = 1_791_158_400_000;
 const RUNTIME_ROLE: &str = "alc_api_rt";
-/// 接続を張り直す回数 (テナント A / B を交互に)
-const ITERATIONS: u32 = 10;
+/// 系列ごとに接続を張り直す回数 (テナント A / B を交互に)。接続は合計 2 + 3 × 5 + 3 = 20 本
+const ITERATIONS: u32 = 5;
 /// 対照系列 (Row を COMMIT の後まで持つ) の回数
-const CONTROL_ITERATIONS: u32 = 5;
+const CONTROL_ITERATIONS: u32 = 3;
 const ROUNDTRIPS: u32 = 20;
+const SET_CONFIG: &str = "SELECT set_config('app.current_tenant_id', $1, true), set_config('search_path', 'alc_api', true)";
 const READ_TENANT: &str = "SELECT current_setting('app.current_tenant_id', true)";
+const READ_SETTINGS: &str =
+    "SELECT current_setting('app.current_tenant_id', true), current_setting('search_path')";
+const ECHO: &str = "SELECT $1::text AS v";
 
-/// 失敗の出し方はこの固定の label だけ (エラーの文は出さない)
+/// tokio-postgres のエラーの種類。`Display` の先頭 (種類ごとに固定の文) → 固定の label
+const PG_KINDS: &[(&str, &str)] = &[
+    ("error communicating with the server", "io"),
+    ("unexpected message from server", "unexpected_message"),
+    ("error performing TLS handshake", "tls"),
+    ("error serializing parameter", "to_sql"),
+    ("error deserializing column", "from_sql"),
+    ("connection closed", "closed"),
+    ("error parsing response from server", "parse"),
+    ("error encoding message to server", "encode"),
+    ("authentication error", "authentication"),
+    ("invalid configuration", "config"),
+    ("error connecting to server", "connect"),
+    ("timeout waiting for server", "timeout"),
+];
+
+/// 接続までの失敗の label (エラーの文は出さない)
 #[derive(Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Label {
@@ -43,9 +65,26 @@ enum Label {
     ConfigParse,
     Socket,
     Handshake,
-    ConnectionTask,
     Query,
 }
+
+/// トランザクションの流し方
+#[derive(Clone, Copy)]
+enum Mode {
+    /// `tx.execute` / `tx.query` (名前付き prepared statement)
+    Named,
+    /// `tx.query_typed` (prepare の往復をしない、名前なしの statement)
+    Typed,
+    /// BEGIN から COMMIT まで `simple_query` / `batch_execute`
+    Simple,
+    /// 対照: Named と同じ問い合わせで、`Row` を COMMIT の後まで持ってから drop する
+    RowDroppedAfterCommit,
+}
+
+/// (失敗した step, エラーの種類)
+type Failure = (&'static str, String);
+/// connection task が Err で終わった回数 (種類ごと)
+type TaskErrors = Rc<RefCell<BTreeMap<String, u32>>>;
 
 /// 1 本目の接続の結果
 #[derive(Serialize)]
@@ -53,7 +92,7 @@ struct Connect {
     ok: bool,
     ms: u64,
     error: Option<Label>,
-    sqlstate: Option<String>,
+    kind: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -64,42 +103,39 @@ struct Role {
     rolbypassrls: Option<bool>,
 }
 
+/// トランザクションの外の単発 (`"ok"` かエラーの種類)
 #[derive(Default, Serialize)]
-struct TxSetting {
-    iterations: u32,
-    held_in_tx: u32,
-    empty_after_commit: u32,
-    leak_before_set: u32,
-    search_path_held: u32,
+struct Single {
+    named: Option<String>,
+    typed: Option<String>,
 }
 
+/// 1 系列 (接続を張り直しながら同じトランザクションを流す) の集計
 #[derive(Default, Serialize)]
-struct Prepared {
+struct Series {
     iterations: u32,
     ok: u32,
-    errors_by_sqlstate: BTreeMap<String, u32>,
+    held_in_tx: u32,
+    search_path_held: u32,
+    empty_after_commit: u32,
+    leak_before_set: u32,
+    tx_p50: u64,
+    failed_step: BTreeMap<&'static str, u32>,
+    errors_by_kind: BTreeMap<String, u32>,
 }
 
-impl Prepared {
-    /// 成功なら `ok` に、失敗なら SQLSTATE (取れなければ `none`) ごとに数える。失敗のとき false
-    fn record(&mut self, result: &Result<TxSeen, PgError>) -> bool {
-        let key = match result {
-            Ok(seen) if seen.echoed => {
-                self.ok += 1;
-                return true;
-            }
-            Ok(_) => "mismatch".to_owned(),
-            Err(e) => sqlstate(e).unwrap_or_else(|| "none".to_owned()),
-        };
-        *self.errors_by_sqlstate.entry(key).or_insert(0) += 1;
-        false
+impl Series {
+    /// 失敗を step と種類ごとに数える (呼び出し側がそのまま return できるよう None を返す)
+    fn fail(&mut self, (step, kind): Failure) -> Option<u64> {
+        *self.failed_step.entry(step).or_insert(0) += 1;
+        *self.errors_by_kind.entry(kind).or_insert(0) += 1;
+        None
     }
 }
 
 #[derive(Default, Serialize)]
 struct Timing {
     connect_p50: u64,
-    tx_p50: u64,
     stmt_roundtrip_avg: f64,
 }
 
@@ -108,15 +144,17 @@ struct Report {
     probe: &'static str,
     connect: Option<Connect>,
     role: Option<Role>,
-    tx_setting: TxSetting,
-    prepared: Prepared,
-    prepared_row_dropped_after_commit: Prepared,
+    single: Single,
+    tx_simple: Series,
+    tx_typed: Series,
+    tx_named: Series,
+    prepared_row_dropped_after_commit: Series,
+    connection_task: BTreeMap<String, u32>,
     timing_ms: Timing,
     errors: Vec<Label>,
 }
 
 /// 1 トランザクションの中で見えたもの (owned な値だけ)
-#[derive(Default)]
 struct TxSeen {
     tenant_held: bool,
     search_path_held: bool,
@@ -127,13 +165,37 @@ fn now() -> u64 {
     Date::now().as_millis()
 }
 
-fn sqlstate(e: &PgError) -> Option<String> {
-    e.as_db_error().map(|db| db.code().code().to_owned())
-}
-
 fn median(mut ms: Vec<u64>) -> u64 {
     ms.sort_unstable();
     ms.get(ms.len() / 2).copied().unwrap_or(0)
+}
+
+/// エラーを、識別子を含まない固定の語に落とす: DB のエラーは SQLSTATE、それ以外は tokio-postgres の
+/// 種類の label ([`PG_KINDS`]。当たらなければ `closed` / `other`)。原因が `io::Error` なら `:<ErrorKind の名前>` を足す。
+/// **`Display` の文は種類の判定に使うだけで、出さない。**
+fn kind(e: &PgError) -> String {
+    if let Some(db) = e.as_db_error() {
+        return db.code().code().to_owned();
+    }
+    let text = e.to_string();
+    let fallback = if e.is_closed() { "closed" } else { "other" };
+    let base = PG_KINDS
+        .iter()
+        .find(|(prefix, _)| text.starts_with(prefix))
+        .map_or(fallback, |(_, label)| label);
+    match e.source().and_then(|s| s.downcast_ref::<std::io::Error>()) {
+        Some(io) => format!("{base}:{:?}", io.kind()),
+        None => base.to_owned(),
+    }
+}
+
+fn outcome<T>(result: Result<T, PgError>) -> String {
+    result.map_or_else(|e| kind(&e), |_| "ok".to_owned())
+}
+
+/// 失敗に step の名前を付ける
+fn at(step: &'static str) -> impl Fn(PgError) -> Failure {
+    move |e| (step, kind(&e))
 }
 
 /// 乱数の UUID (v4)。実在のテナントに当たらない値を `app.current_tenant_id` に入れるため。ログには出さない
@@ -172,10 +234,7 @@ fn col(cols: &[Option<String>], i: usize) -> Option<&str> {
 }
 
 /// Q2: workers-rs の公式例 (examples/tokio-postgres) と同じ形で Hyperdrive へ繋ぐ
-async fn connect(
-    env: &Env,
-    task_failed: &Rc<Cell<bool>>,
-) -> Result<Client, (Label, Option<String>)> {
+async fn connect(env: &Env, task_errors: &TaskErrors) -> Result<Client, (Label, Option<String>)> {
     let hd = env
         .hyperdrive(HD_BINDING)
         .map_err(|_| (Label::HyperdriveBinding, None))?;
@@ -190,12 +249,16 @@ async fn connect(
     let (client, connection) = config
         .connect_raw(socket, PassthroughTls)
         .await
-        .map_err(|e| (Label::Handshake, sqlstate(&e)))?;
-    let task_failed = Rc::clone(task_failed);
+        .map_err(|e| (Label::Handshake, Some(kind(&e))))?;
+    let task_errors = Rc::clone(task_errors);
     wasm_bindgen_futures::spawn_local(async move {
-        if connection.await.is_err() {
-            task_failed.set(true);
-            console_log!(r#"{{"probe":"hyperdrive","error":"connection_task"}}"#);
+        if let Err(e) = connection.await {
+            let kind = kind(&e);
+            // JSON を出した後に落ちた分も残るよう、ここでも固定の形の 1 行を出す
+            console_log!(r#"{{"probe":"hyperdrive","error":"connection_task","kind":"{kind}"}}"#);
+            if let Ok(mut errors) = task_errors.try_borrow_mut() {
+                *errors.entry(kind).or_insert(0) += 1;
+            }
         }
     });
     Ok(client)
@@ -232,139 +295,195 @@ async fn roundtrip_avg(client: &mut Client) -> Result<f64, PgError> {
     Ok(spent as f64 / f64::from(ROUNDTRIPS))
 }
 
-/// Q4 / Q5: テナントをトランザクション単位で設定し (骨格は alc-vein-worker の `in_tenant_tx` と同じ)、
-/// その中で名前付き prepared statement を使う。`Row` は owned な値にして、COMMIT より前に drop する
-async fn tenant_tx(client: &mut Client, tenant: &str) -> Result<TxSeen, PgError> {
-    let tx = client.transaction().await?;
-    tx.execute(
-        "SELECT set_config('app.current_tenant_id', $1, true), set_config('search_path', 'alc_api', true)",
-        &[&tenant],
-    )
-    .await?;
-    let settings = first_row(
-        &tx.simple_query(
-            "SELECT current_setting('app.current_tenant_id', true), current_setting('search_path')",
-        )
-        .await?,
-    );
-    let echoed: Option<String> = tx
-        .query("SELECT $1::text AS v", &[&"x"])
-        .await?
-        .first()
-        .and_then(|row| row.try_get(0).ok());
-    tx.execute("SELECT 1", &[]).await?;
-    tx.commit().await?;
-    Ok(TxSeen {
-        tenant_held: col(&settings, 0) == Some(tenant),
-        search_path_held: col(&settings, 1) == Some("alc_api"),
-        echoed: echoed.as_deref() == Some("x"),
-    })
+fn seen(settings: &[Option<String>], tenant: &str, echoed: Option<&str>) -> TxSeen {
+    TxSeen {
+        tenant_held: col(settings, 0) == Some(tenant),
+        search_path_held: col(settings, 1) == Some("alc_api"),
+        echoed: echoed == Some("x"),
+    }
 }
 
-/// Q5 の対照: 同じ問い合わせで、`Row` (prepared statement を握る) を COMMIT の後まで持ってから drop する
-async fn row_dropped_after_commit_tx(client: &mut Client) -> Result<TxSeen, PgError> {
-    let tx = client.transaction().await?;
-    let rows = tx.query("SELECT $1::text AS v", &[&"x"]).await?;
-    tx.execute("SELECT 1", &[]).await?;
-    tx.commit().await?;
-    let echoed: Option<String> = rows.first().and_then(|row| row.try_get(0).ok());
-    drop(rows);
-    Ok(TxSeen {
-        echoed: echoed.as_deref() == Some("x"),
-        ..TxSeen::default()
-    })
-}
-
-async fn run(env: &Env) -> Report {
-    let task_failed = Rc::new(Cell::new(false));
-    let (tenant_a, tenant_b) = (random_uuid(), random_uuid());
-    let (mut connect_ms, mut tx_ms) = (Vec::new(), Vec::new());
-    let mut r = Report {
-        probe: "hyperdrive",
-        ..Report::default()
+/// Q4 / Q5: テナントをトランザクション単位で設定し (骨格は alc-vein-worker の `in_tenant_tx` と同じ)、その中で
+/// パラメータ付きの問い合わせを流す。`Row` は owned な値にして COMMIT より前に drop する (対照だけ後で drop)
+async fn extended_tx(client: &mut Client, mode: Mode, tenant: &str) -> Result<TxSeen, Failure> {
+    let tx = client.transaction().await.map_err(at("begin"))?;
+    let rows = if matches!(mode, Mode::Typed) {
+        tx.query_typed(SET_CONFIG, &[(&tenant, Type::TEXT)])
+            .await
+            .map_err(at("set_config"))?;
+        let settings = tx.simple_query(READ_SETTINGS).await;
+        let settings = first_row(&settings.map_err(at("read_setting"))?);
+        let rows = tx.query_typed(ECHO, &[(&"x", Type::TEXT)]).await;
+        let rows = rows.map_err(at("query"))?;
+        tx.query_typed("SELECT 1", &[])
+            .await
+            .map_err(at("execute"))?;
+        (settings, rows)
+    } else {
+        tx.execute(SET_CONFIG, &[&tenant])
+            .await
+            .map_err(at("set_config"))?;
+        let settings = tx.simple_query(READ_SETTINGS).await;
+        let settings = first_row(&settings.map_err(at("read_setting"))?);
+        let rows = tx.query(ECHO, &[&"x"]).await.map_err(at("query"))?;
+        tx.execute("SELECT 1", &[]).await.map_err(at("execute"))?;
+        (settings, rows)
     };
-    for i in 0..ITERATIONS {
-        r.tx_setting.iterations += 1;
-        r.prepared.iterations += 1;
-        let started = now();
-        let conn = connect(env, &task_failed).await;
-        let ms = now().saturating_sub(started);
-        if r.connect.is_none() {
-            let (error, sqlstate) = match &conn {
-                Ok(_) => (None, None),
-                Err((label, code)) => (Some(*label), code.clone()),
-            };
-            let ok = conn.is_ok();
-            r.connect = Some(Connect {
-                ok,
-                ms,
-                error,
-                sqlstate,
-            });
-        }
-        let mut client = match conn {
-            Ok(client) => client,
-            Err((label, _)) => {
-                r.errors.push(label);
-                continue;
+    let (settings, rows) = rows;
+    let echoed: Option<String> = rows.first().and_then(|row| row.try_get(0).ok());
+    if matches!(mode, Mode::RowDroppedAfterCommit) {
+        tx.commit().await.map_err(at("commit"))?;
+        drop(rows);
+    } else {
+        drop(rows);
+        tx.commit().await.map_err(at("commit"))?;
+    }
+    Ok(seen(&settings, tenant, echoed.as_deref()))
+}
+
+/// Q4 を拡張プロトコル抜きで: BEGIN から COMMIT まで `simple_query` / `batch_execute`
+async fn simple_tx(client: &Client, tenant: &str) -> Result<TxSeen, Failure> {
+    // 自分で作った UUID だが、SQL に埋める前に 16 進と `-` だけであることを確かめる
+    if !tenant.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') {
+        return Err(("set_config", "invalid_uuid".to_owned()));
+    }
+    client.batch_execute("BEGIN").await.map_err(at("begin"))?;
+    let set_config = SET_CONFIG.replace("$1", &format!("'{tenant}'"));
+    client
+        .simple_query(&set_config)
+        .await
+        .map_err(at("set_config"))?;
+    let settings = client.simple_query(READ_SETTINGS).await;
+    let settings = first_row(&settings.map_err(at("read_setting"))?);
+    let rows = client.simple_query("SELECT 'x'::text AS v").await;
+    let rows = first_row(&rows.map_err(at("query"))?);
+    client
+        .simple_query("SELECT 1")
+        .await
+        .map_err(at("execute"))?;
+    client.batch_execute("COMMIT").await.map_err(at("commit"))?;
+    Ok(seen(&settings, tenant, col(&rows, 0)))
+}
+
+/// 1 接続ぶん: (i) 設定する前に見えないか → (ii) トランザクション → (iii) COMMIT の後に消えているか
+async fn iteration(client: &mut Client, mode: Mode, tenant: &str, s: &mut Series) -> Option<u64> {
+    let is_set = |m: &[SimpleQueryMessage]| col(&first_row(m), 0).is_some_and(|v| !v.is_empty());
+    match client.simple_query(READ_TENANT).await {
+        Ok(m) => s.leak_before_set += u32::from(is_set(&m)),
+        Err(e) => return s.fail(at("read_before")(e)),
+    }
+    let started = now();
+    let result = match mode {
+        Mode::Simple => {
+            let result = simple_tx(client, tenant).await;
+            if result.is_err() {
+                // 開いたままのトランザクションを残さない (失敗しても数えない)
+                let _ = client.batch_execute("ROLLBACK").await;
             }
+            result
+        }
+        _ => extended_tx(client, mode, tenant).await,
+    };
+    let seen = match result {
+        Ok(seen) if seen.echoed => seen,
+        Ok(_) => return s.fail(("query", "mismatch".to_owned())),
+        Err(failure) => return s.fail(failure),
+    };
+    let ms = now().saturating_sub(started);
+    s.ok += 1;
+    s.held_in_tx += u32::from(seen.tenant_held);
+    s.search_path_held += u32::from(seen.search_path_held);
+    match client.simple_query(READ_TENANT).await {
+        Ok(m) => s.empty_after_commit += u32::from(!is_set(&m)),
+        Err(e) => drop(s.fail(at("read_after")(e))),
+    }
+    Some(ms)
+}
+
+struct Probe<'a> {
+    env: &'a Env,
+    task_errors: TaskErrors,
+    connect_ms: Vec<u64>,
+    report: Report,
+}
+
+impl Probe<'_> {
+    /// 接続を 1 本張る。1 本目の結果は `connect` に、失敗の label は `errors` に残す
+    async fn connect(&mut self) -> Option<Client> {
+        let started = now();
+        let conn = connect(self.env, &self.task_errors).await;
+        let ms = now().saturating_sub(started);
+        let (error, kind) = match &conn {
+            Ok(_) => (None, None),
+            Err((label, kind)) => (Some(*label), kind.clone()),
         };
-        connect_ms.push(ms);
-        if i == 0 {
+        let ok = conn.is_ok();
+        self.report.connect.get_or_insert(Connect {
+            ok,
+            ms,
+            error,
+            kind,
+        });
+        match conn {
+            Ok(client) => {
+                self.connect_ms.push(ms);
+                Some(client)
+            }
+            Err((label, _)) => {
+                self.report.errors.push(label);
+                None
+            }
+        }
+    }
+
+    async fn series(&mut self, mode: Mode, iterations: u32, tenants: (&str, &str)) -> Series {
+        let mut s = Series::default();
+        let mut tx_ms = Vec::new();
+        for i in 0..iterations {
+            s.iterations += 1;
+            let Some(mut client) = self.connect().await else {
+                s.fail(("connect", "connect".to_owned()));
+                continue;
+            };
+            let tenant = if i % 2 == 0 { tenants.0 } else { tenants.1 };
+            tx_ms.extend(iteration(&mut client, mode, tenant, &mut s).await);
+        }
+        s.tx_p50 = median(tx_ms);
+        s
+    }
+
+    async fn run(mut self) -> Report {
+        let (a, b) = (random_uuid(), random_uuid());
+        let tenants = (a.as_str(), b.as_str());
+        // 1 本目: ロール・往復の時間・単発の query_typed (どれも prepare の往復をしない)
+        if let Some(mut client) = self.connect().await {
             match role(&client).await {
-                Ok(role) => r.role = Some(role),
-                Err(_) => r.errors.push(Label::Query),
+                Ok(role) => self.report.role = Some(role),
+                Err(_) => self.report.errors.push(Label::Query),
             }
             match roundtrip_avg(&mut client).await {
-                Ok(avg) => r.timing_ms.stmt_roundtrip_avg = avg,
-                Err(_) => r.errors.push(Label::Query),
+                Ok(avg) => self.report.timing_ms.stmt_roundtrip_avg = avg,
+                Err(_) => self.report.errors.push(Label::Query),
             }
+            self.report.single.typed = Some(outcome(client.query_typed("SELECT 1", &[]).await));
         }
-        // (i) トランザクションの前: 前の利用者の設定が残っていないか
-        match client.simple_query(READ_TENANT).await {
-            Ok(m) if col(&first_row(&m), 0).is_some_and(|v| !v.is_empty()) => {
-                r.tx_setting.leak_before_set += 1
-            }
-            Ok(_) => {}
-            Err(_) => r.errors.push(Label::Query),
+        // 2 本目: 単発の名前付き prepared statement (接続ごと落ちても他に響かないよう、これだけで 1 本使う)
+        if let Some(client) = self.connect().await {
+            self.report.single.named = Some(outcome(client.query("SELECT 1", &[]).await));
         }
-        // (ii) トランザクションの中
-        let tenant = if i % 2 == 0 { &tenant_a } else { &tenant_b };
-        let started = now();
-        let seen = tenant_tx(&mut client, tenant).await;
-        if !r.prepared.record(&seen) {
-            r.errors.push(Label::Query);
+        // 接続を壊しにくい順に流す。対照は最後 (握ったままの prepared statement の影響は次の接続・次の実行以降に出る)
+        self.report.tx_simple = self.series(Mode::Simple, ITERATIONS, tenants).await;
+        self.report.tx_typed = self.series(Mode::Typed, ITERATIONS, tenants).await;
+        self.report.tx_named = self.series(Mode::Named, ITERATIONS, tenants).await;
+        self.report.prepared_row_dropped_after_commit = self
+            .series(Mode::RowDroppedAfterCommit, CONTROL_ITERATIONS, tenants)
+            .await;
+        if let Ok(errors) = self.task_errors.try_borrow() {
+            self.report.connection_task = errors.clone();
         }
-        let Ok(seen) = seen else { continue };
-        tx_ms.push(now().saturating_sub(started));
-        r.tx_setting.held_in_tx += u32::from(seen.tenant_held);
-        r.tx_setting.search_path_held += u32::from(seen.search_path_held);
-        // (iii) COMMIT の後: 同じ接続で設定が消えているか
-        match client.simple_query(READ_TENANT).await {
-            Ok(m) if col(&first_row(&m), 0).is_some_and(|v| !v.is_empty()) => {}
-            Ok(_) => r.tx_setting.empty_after_commit += 1,
-            Err(_) => r.errors.push(Label::Query),
-        }
+        self.report.timing_ms.connect_p50 = median(self.connect_ms);
+        self.report
     }
-    // 対照は最後に流す (握ったままの prepared statement の影響は、次の接続・次の実行以降に出る)
-    for _ in 0..CONTROL_ITERATIONS {
-        r.prepared_row_dropped_after_commit.iterations += 1;
-        match connect(env, &task_failed).await {
-            Ok(mut client) => {
-                let seen = row_dropped_after_commit_tx(&mut client).await;
-                if !r.prepared_row_dropped_after_commit.record(&seen) {
-                    r.errors.push(Label::Query);
-                }
-            }
-            Err((label, _)) => r.errors.push(label),
-        }
-    }
-    if task_failed.get() {
-        r.errors.push(Label::ConnectionTask);
-    }
-    r.timing_ms.connect_p50 = median(connect_ms);
-    r.timing_ms.tx_p50 = median(tx_ms);
-    r
 }
 
 /// 外へ Err を返さない (未捕捉の例外としてエラーの文がログに残るため)
@@ -374,7 +493,16 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
         console_log!(r#"{{"probe":"hyperdrive","expired":true}}"#);
         return;
     }
-    match serde_json::to_string(&run(&env).await) {
+    let probe = Probe {
+        env: &env,
+        task_errors: TaskErrors::default(),
+        connect_ms: Vec::new(),
+        report: Report {
+            probe: "hyperdrive",
+            ..Report::default()
+        },
+    };
+    match serde_json::to_string(&probe.run().await) {
         Ok(line) => console_log!("{line}"),
         Err(_) => console_log!(r#"{{"probe":"hyperdrive","errors":["serialize"]}}"#),
     }

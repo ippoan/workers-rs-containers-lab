@@ -195,27 +195,27 @@ worker-build 0.8.7 --release (wasm-opt 後)。gzip は `gzip -9`。
 Workers の TCP の代わりに **Cloudflare Hyperdrive 経由**で DB に繋ぐ形を、workers-rs 0.8.7 + tokio-postgres の組で確かめる
 (Refs ippoan/rust-alc-api#725 / ippoan/rust-alc-api#723)。`wrangler dev` は Hyperdrive を通らないので、配信した worker で測る。
 
-- **外から届く口が無い**: HTTP のハンドラを持たず、定時実行 (5 分ごと) だけ。`workers_dev` / `preview_urls` はどの env も false、
+- **外から届く口が無い**: HTTP のハンドラを持たず、定時実行 (1 分ごと) だけ。`workers_dev` / `preview_urls` はどの env も false、
   route 無し (`check-exposure.sh --private`)。DB の宛先は Hyperdrive の設定が決め、repo に在るのは設定の ID だけ
 - 読むのは `current_user`・`pg_roles` の自分の行・`current_setting` だけ (業務の表は読まない・書かない)
-- 1 回の実行で 1 行の JSON をログに出す。出すのはロール名・真偽・回数・SQLSTATE・ms・固定の label だけ
-  (エラーの文は出さない。label は `hyperdrive_binding` / `config_parse` / `socket` / `handshake` / `connection_task` / `query`)
-- 配信は手動 (CI は build まで): `cd probe-hyperdrive && wrangler deploy --env staging`。
-  ログは `wrangler tail --env staging --format json` で読む (`logs[].message` が上の 1 行)。
-  測り終えたら `wrangler delete --env staging` で片付ける
+- 配信は手動 (CI は build まで): `cd probe-hyperdrive && wrangler deploy --env staging`。測り終えたら `wrangler delete --env staging`
 - 期限: `src/lib.rs` の `EXPIRES_AT_MS` (2026-10-05T00:00:00Z) を過ぎた実行は、DB に繋がず `{"probe":"hyperdrive","expired":true}` だけ出す
 
-確かめる問いと JSON の項目:
+ログの読み方 (`wrangler tail --env staging --format json` の `logs[].message`)。1 回の実行 (接続は逐次に 20 本) で 1 行の JSON:
 
 | 問い | 中身 | JSON の項目 |
 |---|---|---|
-| Q2 | 公式例の形 (`env.hyperdrive` → `Socket` の StartTls → `connect_raw(socket, PassthroughTls)`) で繋がるか | `connect` (1 本目。失敗は label と SQLSTATE) |
+| Q2 | 公式例の形 (`env.hyperdrive` → `Socket` の StartTls → `connect_raw(socket, PassthroughTls)`) で繋がるか | `connect` (1 本目)・`errors` (接続までの失敗の label) |
 | Q3 | 接続のロール | `role` |
-| Q4 | トランザクション単位の設定 (`set_config(…, true)`) が、中では効き・COMMIT で消え・次の接続に漏れないか。接続を 10 回張り直す | `tx_setting` |
-| Q5 | 名前付き prepared statement がトランザクションの中で使えるか。対照は `Row` を COMMIT の後まで持つ形 (5 回、最後に流す) | `prepared` / `prepared_row_dropped_after_commit` |
-| Q6 | 接続・1 トランザクションの中央値と、1 トランザクションの中の `SELECT 1` 20 回の 1 文あたりの平均 (`Date.now` の差。参考値) | `timing_ms` |
+| Q4 | トランザクション単位の設定 (`set_config(…, true)`) が、中では効き (`held_in_tx`・`search_path_held`)・COMMIT で消え (`empty_after_commit`)・設定する前に見えない (`leak_before_set` = 0) か | 下の 3 系列それぞれ (接続を張り直して各 5 回) |
+| Q5 | 問い合わせの流し方ごとの可否。`tx_simple`: BEGIN から COMMIT まで simple query / `tx_typed`: `query_typed` (名前なしの statement) / `tx_named`: `execute`・`query` (名前付き prepared statement)。対照 (3 回、最後) は `tx_named` の形で `Row` を COMMIT の後まで持つ | `tx_simple` / `tx_typed` / `tx_named` / `prepared_row_dropped_after_commit`、トランザクションの外の単発は `single.typed` / `single.named` |
+| Q6 | 接続・1 トランザクションの中央値と、1 トランザクションの中の `SELECT 1` 20 回の 1 文あたりの平均 (`Date.now` の差。参考値) | `timing_ms`・各系列の `tx_p50` |
 
-対照が握ったままにした prepared statement の影響は次の実行以降に出うるので、`prepared` は配信後 1 回目の実行の値も見る。
+- 系列の失敗は `failed_step` (`begin` / `set_config` / `read_setting` / `query` / `execute` / `commit` ほか) と `errors_by_kind` に数える。
+  接続の task が Err で終わった回数は `connection_task` (同じ形の 1 行 `{"probe":"hyperdrive","error":"connection_task","kind":…}` も出る)
+- エラーの種類 (kind) は、DB のエラーなら SQLSTATE、それ以外は固定の label (`io` / `unexpected_message` / `closed` / `parse` / `other` など。
+  原因が io エラーなら `:<ErrorKind の名前>` が付く)。**エラーの文は出さない**
+- 対照が握ったままにした prepared statement の影響は次の実行以降に出うるので、`tx_named` は配信後 1 回目の実行の値も見る
 
 結果 (staging。実測の後に埋める):
 
@@ -223,7 +223,7 @@ Workers の TCP の代わりに **Cloudflare Hyperdrive 経由**で DB に繋ぐ
 |---|---|
 | Q2 接続 | |
 | Q4 トランザクション単位の設定 | |
-| Q5 prepared statement | |
+| Q5 問い合わせの流し方 | |
 | Q6 所要時間 (ms) | |
 
 ## 構成

@@ -14,7 +14,7 @@ preview_urls = false
 [build]
 command = "cargo install -q worker-build@0.8.7 --locked && worker-build --release"
 
-# staging: 5 分ごとに 1 回動き、結果を 1 行の JSON でログに出す (README 参照)。
+# staging: 1 分ごとに 1 回動き、結果を 1 行の JSON でログに出す (README 参照)。
 # 期限 (src/lib.rs の EXPIRES_AT_MS) を過ぎると DB に繋がない。測り終えたら wrangler delete --env staging で片付ける
 [env.staging]
 name = "probe-hyperdrive-staging"
@@ -25,7 +25,7 @@ preview_urls = false
 enabled = true
 
 [env.staging.triggers]
-crons = ["*/5 * * * *"]
+crons = ["* * * * *"]
 
 [[env.staging.hyperdrive]]
 binding = "HD"
