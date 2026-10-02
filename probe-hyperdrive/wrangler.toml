@@ -24,6 +24,11 @@ preview_urls = false
 [env.staging.observability]
 enabled = true
 
+# Placement Hints: worker-unknown と同じく、worker を DB の近く (AWS 東京リージョンの近く) で動かす。
+# 定時実行に効くかは実測で確かめる (1 文の往復の時間が変わるかを見る)。staging だけ
+[env.staging.placement]
+region = "aws:ap-northeast-1"
+
 [env.staging.triggers]
 crons = ["* * * * *"]
 

@@ -198,6 +198,7 @@ Workers の TCP の代わりに **Cloudflare Hyperdrive 経由**で DB に繋ぐ
 - **外から届く口が無い**: HTTP のハンドラを持たず、定時実行 (1 分ごと) だけ。`workers_dev` / `preview_urls` はどの env も false、
   route 無し (`check-exposure.sh --private`)。DB の宛先は Hyperdrive の設定が決め、repo に在るのは設定の ID だけ
 - 読むのは `current_user`・`pg_roles` の自分の行・`current_setting` だけ (業務の表は読まない・書かない)
+- staging は `[env.staging.placement] region = "aws:ap-northeast-1"` (Placement Hints。定時実行に効くかは実測で確かめる)
 - 配信は手動 (CI は build まで): `cd probe-hyperdrive && wrangler deploy --env staging`。測り終えたら `wrangler delete --env staging`
 - 期限: `src/lib.rs` の `EXPIRES_AT_MS` (2026-10-05T00:00:00Z) を過ぎた実行は、DB に繋がず `{"probe":"hyperdrive","expired":true}` だけ出す
 
