@@ -4,7 +4,8 @@
 # トップレベルも env.staging も workers_dev = false / preview_urls = false、route / routes / custom_domain を書かない
 # (scripts/check-exposure.sh が --private で「どの env でも false」を検査する)。
 # DB の宛先は Hyperdrive の設定が決める (ここに書くのは設定の ID だけ。宛先・認証情報は Cloudflare 側に在る)。
-# 配信は手動 (wrangler deploy --env staging)。CI は build までで、配信しない。トップレベルは配信しない。
+# 動かすのは手動 (wrangler dev --remote --env staging --test-scheduled、または wrangler deploy --env staging。README 参照)。
+# CI は build までで、配信しない。トップレベルは配信しない。
 name = "probe-hyperdrive"
 main = "build/index.js"
 compatibility_date = "2026-09-01"
@@ -24,8 +25,8 @@ preview_urls = false
 [env.staging.observability]
 enabled = true
 
-# Placement Hints: worker-unknown と同じく、worker を DB の近く (AWS 東京リージョンの近く) で動かす。
-# 定時実行に効くかは実測で確かめる (1 文の往復の時間が変わるかを見る)。staging だけ
+# Placement Hints: worker-unknown と同じく、worker を DB の近く (AWS 東京リージョンの近く) で動かす指定。
+# 定時実行では効かなかった (実測。1 文の往復の時間は変わらなかった)。fetch では未測定。staging だけ
 [env.staging.placement]
 region = "aws:ap-northeast-1"
 

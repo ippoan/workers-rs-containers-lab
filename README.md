@@ -193,16 +193,28 @@ worker-build 0.8.7 --release (wasm-opt 後)。gzip は `gzip -9`。
 ## Hyperdrive の probe (`probe-hyperdrive/`)
 
 Workers の TCP の代わりに **Cloudflare Hyperdrive 経由**で DB に繋ぐ形を、workers-rs 0.8.7 + tokio-postgres の組で確かめる
-(Refs ippoan/rust-alc-api#725 / ippoan/rust-alc-api#723)。`wrangler dev` は Hyperdrive を通らないので、配信した worker で測る。
+(Refs ippoan/rust-alc-api#725 / ippoan/rust-alc-api#723)。
 
 - **外から届く口が無い**: HTTP のハンドラを持たず、定時実行 (1 分ごと) だけ。`workers_dev` / `preview_urls` はどの env も false、
   route 無し (`check-exposure.sh --private`)。DB の宛先は Hyperdrive の設定が決め、repo に在るのは設定の ID だけ
 - 読むのは `current_user`・`pg_roles` の自分の行・`current_setting` だけ (業務の表は読まない・書かない)
-- staging は `[env.staging.placement] region = "aws:ap-northeast-1"` (Placement Hints。定時実行に効くかは実測で確かめる)
-- 配信は手動 (CI は build まで): `cd probe-hyperdrive && wrangler deploy --env staging`。測り終えたら `wrangler delete --env staging`
 - 期限: `src/lib.rs` の `EXPIRES_AT_MS` (2026-10-05T00:00:00Z) を過ぎた実行は、DB に繋がず `{"probe":"hyperdrive","expired":true}` だけ出す
 
-ログの読み方 (`wrangler tail --env staging --format json` の `logs[].message`)。1 回の実行 (接続は逐次に 20 本) で 1 行の JSON:
+### 動かし方
+
+1. **配信せずに動かす (第一の手段)**: `cd probe-hyperdrive && npx wrangler@latest dev --remote --env staging --test-scheduled --port <port>`
+   を立て、`curl "http://127.0.0.1:<port>/__scheduled"` で 1 回動かす。Hyperdrive の実物を通る。1 回 13〜19 秒で、
+   結果の JSON は wrangler dev の出力に出る
+   - wrangler 4.58.0 では `Could not create remote preview session` で立たず、最新 (4.147 系) で立った
+   - ローカルの `wrangler dev` (`--remote` なし) は Hyperdrive を通らない
+2. **配信して定時実行で動かす (第二の手段。CI は build までで、配信は手動)**: `wrangler deploy --env staging` の後、
+   `wrangler tail --env staging --format json` の `logs[].message` を読む。片付けは `wrangler delete --env staging`
+   - 定時実行の間隔を変えて再配信しても、反映まで前の間隔で動き続けた
+   - 再配信すると、張ってあった tail に新しい版のイベントが来ないので張り直す
+
+### ログの読み方
+
+1 回の実行 (接続は逐次に 20 本) で 1 行の JSON:
 
 | 問い | 中身 | JSON の項目 |
 |---|---|---|
@@ -216,16 +228,20 @@ Workers の TCP の代わりに **Cloudflare Hyperdrive 経由**で DB に繋ぐ
   接続の task が Err で終わった回数は `connection_task` (同じ形の 1 行 `{"probe":"hyperdrive","error":"connection_task","kind":…}` も出る)
 - エラーの種類 (kind) は、DB のエラーなら SQLSTATE、それ以外は固定の label (`io` / `unexpected_message` / `closed` / `parse` / `other` など。
   原因が io エラーなら `:<ErrorKind の名前>` が付く)。**エラーの文は出さない**
-- 対照が握ったままにした prepared statement の影響は次の実行以降に出うるので、`tx_named` は配信後 1 回目の実行の値も見る
 
-結果 (staging。実測の後に埋める):
+### 結果
+
+2026-10-02 の実測 (worker 0.8.7 + tokio-postgres 0.7.18。接続 20 本を逐次)。
+
+**Hyperdrive 経由では、トランザクションの中の引数付きの文は `query_typed` か simple query で書く。
+tokio-postgres の `query` / `execute` (名前付き prepared statement) は使えない。**
 
 | 問い | 結果 |
 |---|---|
-| Q2 接続 | |
-| Q4 トランザクション単位の設定 | |
-| Q5 問い合わせの流し方 | |
-| Q6 所要時間 (ms) | |
+| Q2 接続 | 公式例の形で繋がる。接続 2〜5 ms |
+| Q4 トランザクション単位の設定 | `tx_simple` 5/5・`tx_typed` 5/5 で、`app.current_tenant_id` と `search_path` がトランザクションの中で保たれ、COMMIT の後は空、張り直した次の接続に前の値は見えない (leak 0)。4 回の実行すべてで同じ |
+| Q5 問い合わせの流し方 | `simple_query` / `batch_execute` だけ: 通る (5/5)<br>`query_typed` (名前なし・1 往復): 通る (5/5)<br>名前付き prepared statement (`tx.execute` / `tx.query`) をトランザクションの中で: **0/5**。`set_config` の step で `unexpected_message`、またはその次の文で `closed`<br>トランザクションの外の単発: `query_typed` は ok。名前付きは回によって ok / `unexpected_message`<br>Hyperdrive の caching の有効・無効で結果は変わらなかった |
+| Q6 所要時間 (ms、参考値) | 1 文の往復の平均: `wrangler dev --remote` (手元の近くの拠点) で 71.7 / 72.95 / 84.75 / 122.85、定時実行で 237〜252<br>1 トランザクション (6 文前後): remote で 525〜587、定時実行で 1438〜1520<br>**`[env.staging.placement]` を入れても定時実行の値は変わらなかった (244)**。fetch で動く worker での値は測っていない |
 
 ## 構成
 
