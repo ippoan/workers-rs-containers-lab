@@ -1,0 +1,8 @@
+/node_modules
+/.wrangler
+/.alc-migrations
+/dist
+.dev.vars*
+/.prebuilt
+# 依存の版は package.json で exact に固定する (lockfile は commit しない)
+/package-lock.json
