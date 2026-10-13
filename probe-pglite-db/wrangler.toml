@@ -16,10 +16,11 @@ preview_urls = false
 [build]
 command = "bash scripts/fetch-migrations.sh && node scripts/gen-prebuilt-wasm.mjs"
 
-# PGlite の wasm は CompiledWasm (既定の規則)、pglite.data (postgres の share 等の fs bundle) は ArrayBuffer で同梱する
+# PGlite の wasm は CompiledWasm (既定の規則)、pglite.data (postgres の share 等の fs bundle) と initdb 済みの datadir
+# (.prebuilt/datadir.tar.gz) は ArrayBuffer で同梱する
 [[rules]]
 type = "Data"
-globs = ["**/*.data"]
+globs = ["**/*.data", "**/*.tar.gz"]
 fallthrough = true
 
 # PGlite は wasm・data を渡しても `new URL("./pglite.data", import.meta.url)` を無条件に作る。Workers の bundle では

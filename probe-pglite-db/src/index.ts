@@ -15,8 +15,11 @@ import { PGlite } from "@electric-sql/pglite";
 // (package の exports が dist を出していないので相対パスで取る)。pglite.wasm だけは memory の宣言を書き換えた版
 // (scripts/gen-prebuilt-wasm.mjs が作る)
 import pgliteWasm from "../.prebuilt/pglite.wasm";
+// initdb.wasm は実行しない (datadir は同梱)。渡さないと PGlite が裏で import.meta.url から取りに行くので、module だけ渡す
 import initdbWasm from "../node_modules/@electric-sql/pglite/dist/initdb.wasm";
 import pgliteData from "../node_modules/@electric-sql/pglite/dist/pglite.data";
+// initdb を済ませた空の datadir (gzip の tar。scripts/gen-prebuilt-wasm.mjs が作る)。実行時に initdb を走らせない
+import dataDir from "../.prebuilt/datadir.tar.gz";
 // scripts/fetch-migrations.sh が ALC_MIGRATIONS_REV の版から作る (commit しない)
 import bundle from "../.alc-migrations/bundle.json";
 import { PGLITE_INITIAL_MIB, POSTGRESQL_CONF, RUNTIME_ROLE, setupSteps } from "./steps.js";
@@ -48,6 +51,7 @@ async function start(): Promise<PGlite> {
       pgliteWasmModule: pgliteWasm,
       initdbWasmModule: initdbWasm,
       fsBundle: new Blob([pgliteData]),
+      loadDataDir: new Blob([dataDir]),
       initialMemory: PGLITE_INITIAL_MIB * 1024 * 1024,
       postgresqlconf: POSTGRESQL_CONF,
     });
@@ -99,11 +103,14 @@ function nextMessage(buf: Uint8Array, startup: boolean): { kind: "ssl" | "cancel
     if (buf.length < 8) return null;
     const len = view.getInt32(0);
     const code = view.getInt32(4);
+    // postgres でない先頭 (probe-hyperdrive の echo など) は、残りを待たずに閉じる (直列の接続を塞がない)
+    if (code !== SSL_REQUEST && code !== CANCEL_REQUEST && code !== PROTOCOL_V3) {
+      throw new Error(`unsupported startup code ${code}`);
+    }
     if (buf.length < len) return null;
     if (len === 8 && code === SSL_REQUEST) return { kind: "ssl", len };
     if (len === 16 && code === CANCEL_REQUEST) return { kind: "cancel", len };
-    if (code === PROTOCOL_V3) return { kind: "msg", len };
-    throw new Error(`unsupported startup code ${code}`);
+    return { kind: "msg", len };
   }
   if (buf.length < 5) return null;
   const len = 1 + view.getInt32(1);
@@ -117,7 +124,13 @@ function concat(a: Uint8Array, b: Uint8Array): Uint8Array {
   return out;
 }
 
-export class PgliteDb extends DurableObject {
+interface Env {
+  /// "echo" なら PGlite を起動せず、connect で受けたバイトをそのまま返す (JS の DO の connect 経路だけを確かめる。
+  /// `wrangler deploy --env staging --var PGLITE_MODE:echo`)。それ以外は PGlite
+  PGLITE_MODE?: string;
+}
+
+export class PgliteDb extends DurableObject<Env> {
   private db: Promise<PGlite> | null = null;
   /// 接続を 1 本ずつに直列化する鎖
   private queue: Promise<void> = Promise.resolve();
@@ -127,24 +140,47 @@ export class PgliteDb extends DurableObject {
   }
 
   async connect(socket: Socket): Promise<void> {
+    if (this.env.PGLITE_MODE === "echo") {
+      const started = Date.now();
+      const reader = socket.readable.getReader();
+      const writer = socket.writable.getWriter();
+      let bytes = 0;
+      try {
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          bytes += value.length;
+          await writer.write(value);
+        }
+        console.log(JSON.stringify({ probe: "pglite-db", mode: "echo", ok: true, bytes, ms: Date.now() - started }));
+      } catch (e) {
+        console.log(JSON.stringify({ probe: "pglite-db", mode: "echo", ok: false, bytes, error: errorText(e) }));
+      } finally {
+        await socket.close().catch(() => {});
+      }
+      return;
+    }
     const turn = this.queue.then(() => this.serve(socket));
     this.queue = turn.catch(() => {});
     return turn;
   }
 
+  /// 最初の接続で起動する。起動に失敗したら次の接続で起動し直す
+  private async ready(): Promise<PGlite> {
+    this.db ??= start();
+    try {
+      return await this.db;
+    } catch (e) {
+      this.db = null;
+      throw e;
+    }
+  }
+
   private async serve(socket: Socket): Promise<void> {
     const writer = socket.writable.getWriter();
     const reader = socket.readable.getReader();
-    let db: PGlite;
-    try {
-      // 最初の接続で起動する。起動に失敗したら次の接続で起動し直す
-      this.db ??= start();
-      db = await this.db;
-    } catch (e) {
-      this.db = null;
-      await socket.close().catch(() => {});
-      return;
-    }
+    // PGlite は、最初の postgres のメッセージ (StartupMessage) が届いてから起動する (postgres でない接続では起動しない)
+    let db: PGlite | null = null;
     let buf: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
     let startup = true;
     let messages = 0;
@@ -165,9 +201,11 @@ export class PgliteDb extends DurableObject {
           if (next.kind === "cancel") continue;
           // Terminate: PGlite には渡さずにここで閉じる (後片付けは finally)
           if (!startup && message[0] === 0x58) break read;
+          db ??= await this.ready();
+          const pg = db;
           const out: Uint8Array[] = [];
-          await db.runExclusive(() =>
-            db.execProtocolRawStream(message, { onRawData: (chunk) => out.push(chunk.slice()) }),
+          await pg.runExclusive(() =>
+            pg.execProtocolRawStream(message, { onRawData: (chunk) => out.push(chunk.slice()) }),
           );
           if (startup) {
             startup = false;
@@ -183,8 +221,10 @@ export class PgliteDb extends DurableObject {
     } finally {
       // 次の接続へ持ち越さない: 開いたままの transaction・SET・ロールを戻す
       try {
-        if (db.isInTransaction()) await db.exec("ROLLBACK");
-        await db.exec("RESET ALL; RESET SESSION AUTHORIZATION;");
+        if (db) {
+          if (db.isInTransaction()) await db.exec("ROLLBACK");
+          await db.exec("RESET ALL; RESET SESSION AUTHORIZATION;");
+        }
       } catch (e) {
         console.log(JSON.stringify({ probe: "pglite-db", reset_error: errorText(e) }));
       }
