@@ -1,0 +1,17 @@
+{
+  "name": "probe-pglite-db",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "deploy": "wrangler deploy --env staging"
+  },
+  "dependencies": {
+    "@electric-sql/pglite": "0.5.8"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20260930.2",
+    "typescript": "5.9.3",
+    "wrangler": "4.145.0"
+  }
+}

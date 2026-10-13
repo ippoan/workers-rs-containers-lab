@@ -1,0 +1,64 @@
+# Durable Object `PgliteDb` (DO の中で PGlite を動かす試作) を持つスクリプト (Refs ohishi-exp/rust-leave-worker#1)。
+# probe-hyperdrive (env.staging) が DO binding の script_name でこの DO を参照し、`Stub::connect` で繋ぐ。
+#
+# 外から届く口を持たない: HTTP の fetch は 404 だけ。トップレベルも env.staging も workers_dev = false /
+# preview_urls = false、route / routes / custom_domain を書かない (scripts/check-exposure.sh が --private で検査する)。
+# DO の connect 口に認可は無い (到達できるのは DO binding を持つ Worker だけ)。seed の 2 テナントだけを置く測定用で、
+# 本実装の境界にはしない (README)。
+# 動かすのは手動 (wrangler deploy --env staging。README 参照)。CI は dry-run までで、配信しない。トップレベルは配信しない。
+name = "probe-pglite-db"
+main = "src/index.ts"
+compatibility_date = "2026-09-01"
+workers_dev = false
+preview_urls = false
+
+# migration の SQL を ALC_MIGRATIONS_REV の版で取り出して .alc-migrations/bundle.json にまとめる
+[build]
+command = "bash scripts/fetch-migrations.sh && node scripts/gen-prebuilt-wasm.mjs"
+
+# PGlite の wasm は CompiledWasm (既定の規則)、pglite.data (postgres の share 等の fs bundle) は ArrayBuffer で同梱する
+[[rules]]
+type = "Data"
+globs = ["**/*.data"]
+fallthrough = true
+
+# PGlite は wasm・data を渡しても `new URL("./pglite.data", import.meta.url)` を無条件に作る。Workers の bundle では
+# import.meta.url が URL にならず "Invalid URL string." で起動が止まるので、取りに行かない仮の base を与える
+[define]
+"import.meta.url" = '"https://pglite.invalid/"'
+"process.versions.node" = "undefined"
+"self.location.href" = '"https://pglite.invalid/"'
+
+# PGlite は node で動くときだけ node の組み込みを動的 import する。nodejs_compat を付けると `process.versions.node` が
+# 在って node の経路 (createRequire・process.binding) に入り起動できないので、付けずに組み込みを空のモジュールへ向ける
+[alias]
+"fs" = "./src/node-stub.js"
+"fs/promises" = "./src/node-stub.js"
+"module" = "./src/node-stub.js"
+"stream" = "./src/node-stub.js"
+"stream/promises" = "./src/node-stub.js"
+"util" = "./src/node-stub.js"
+"zlib" = "./src/node-stub.js"
+
+[env.staging]
+name = "probe-pglite-db-staging"
+workers_dev = false
+preview_urls = false
+
+[env.staging.observability]
+enabled = true
+
+# define も env に継承されない (トップレベルの [define] と同じ値)
+[env.staging.define]
+"import.meta.url" = '"https://pglite.invalid/"'
+"process.versions.node" = "undefined"
+"self.location.href" = '"https://pglite.invalid/"'
+
+# env は継承しないので DO binding と migrations は env.staging に書く
+[[env.staging.durable_objects.bindings]]
+name = "PGLITE_DB"
+class_name = "PgliteDb"
+
+[[env.staging.migrations]]
+tag = "v1"
+new_sqlite_classes = ["PgliteDb"]

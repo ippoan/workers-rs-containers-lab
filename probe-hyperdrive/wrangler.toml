@@ -33,6 +33,13 @@ region = "aws:ap-northeast-1"
 [env.staging.triggers]
 crons = ["* * * * *"]
 
+# DO 経由の系列 (src/pglite.rs): probe-pglite-db-staging の DO PgliteDb (DO の中の PGlite) へ Stub::connect で繋ぐ。
+# probe-pglite-db を先に deploy しておく (README)
+[[env.staging.durable_objects.bindings]]
+name = "PGLITE_DB"
+class_name = "PgliteDb"
+script_name = "probe-pglite-db-staging"
+
 [[env.staging.hyperdrive]]
 binding = "HD"
 id = "6bdf446634034f989d4e094d5510b162"

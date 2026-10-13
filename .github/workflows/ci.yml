@@ -4,7 +4,8 @@
 # デプロイ直後に「token 無しでは Access に止められる」ことを確かめる。
 # probe (probe-unknown / probe-emscripten: ZIP・署名・PDF がターゲットごとに動くか) は DB を使わないので、
 # 上とは独立に、自分の build が通ったら並列にデプロイする。README 参照。
-# probe-hyperdrive (Hyperdrive 経由の DB 接続を測る。定時実行だけ) は検査と build まで。CI からは配信しない (手動)。
+# probe-hyperdrive (Hyperdrive 経由の DB 接続を測る。定時実行だけ) と probe-pglite-db (DO の中の PGlite) は検査と build まで。
+# CI からは配信しない (手動)。
 name: CI
 
 on:
@@ -31,7 +32,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: 外から直接届かないことの検査
-        run: bash scripts/check-exposure.sh worker-unknown/wrangler.toml worker-emscripten/wrangler.toml probe-unknown/wrangler.toml probe-emscripten/wrangler.toml --private lab-db/wrangler.toml --private probe-hyperdrive/wrangler.toml
+        run: bash scripts/check-exposure.sh worker-unknown/wrangler.toml worker-emscripten/wrangler.toml probe-unknown/wrangler.toml probe-emscripten/wrangler.toml --private lab-db/wrangler.toml --private probe-hyperdrive/wrangler.toml --private probe-pglite-db/wrangler.toml
       - name: check-exposure.sh の陰性対照
         run: bash scripts/check-exposure-test.sh worker-unknown/wrangler.toml
       - name: check-exposure.sh の陰性対照 (worker-emscripten)
@@ -44,6 +45,8 @@ jobs:
         run: bash scripts/check-exposure-test.sh --private lab-db/wrangler.toml
       - name: check-exposure.sh の陰性対照 (probe-hyperdrive、--private)
         run: bash scripts/check-exposure-test.sh --private probe-hyperdrive/wrangler.toml
+      - name: check-exposure.sh の陰性対照 (probe-pglite-db、--private)
+        run: bash scripts/check-exposure-test.sh --private probe-pglite-db/wrangler.toml
 
   # Container (postgres + PgBouncer transaction mode) が空の DB から立ち上がり、
   # superuser ではない bench で items (1000 行) が読めること
@@ -228,6 +231,24 @@ jobs:
       - run: worker-build --release
       - name: bundle サイズ (上限は圧縮前 64 MiB)
         run: bash ../bench/bundle-size.sh probe-hyperdrive build/index_bg.wasm
+
+  # DO PgliteDb (DO の中の PGlite) を持つ TS のスクリプト。probe-hyperdrive が script_name で参照する。
+  # 型検査と dry-run (migration の取得・実行時にコンパイルされる wasm の作成を含む build) まで。配信しない (手動)
+  probe-pglite-db:
+    name: probe-pglite-db (TS、DO + PGlite)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: probe-pglite-db
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      # lockfile は commit しない (依存は package.json で exact 版に固定)
+      - run: npm install --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npx wrangler deploy --dry-run --env staging
 
   # DO LabDb と Container を持つスクリプト (A・B が script_name で参照する)
   lab-db:
@@ -631,8 +652,8 @@ jobs:
   # deploy-staging-* は main への push 限定なので、PR の merge を gate しない (deploy_gate_ignore)
   auto-merge:
     name: Auto Merge
-    needs: [exposure, container, lab-db, worker-unknown, worker-emscripten, probe-unknown, probe-emscripten, probe-hyperdrive]
-    if: github.event_name == 'pull_request' && needs.exposure.result == 'success' && needs.container.result == 'success' && needs.lab-db.result == 'success' && needs.worker-unknown.result == 'success' && needs.worker-emscripten.result == 'success' && needs.probe-unknown.result == 'success' && needs.probe-emscripten.result == 'success' && needs.probe-hyperdrive.result == 'success'
+    needs: [exposure, container, lab-db, worker-unknown, worker-emscripten, probe-unknown, probe-emscripten, probe-hyperdrive, probe-pglite-db]
+    if: github.event_name == 'pull_request' && needs.exposure.result == 'success' && needs.container.result == 'success' && needs.lab-db.result == 'success' && needs.worker-unknown.result == 'success' && needs.worker-emscripten.result == 'success' && needs.probe-unknown.result == 'success' && needs.probe-emscripten.result == 'success' && needs.probe-hyperdrive.result == 'success' && needs.probe-pglite-db.result == 'success'
     uses: ippoan/ci-workflows/.github/workflows/auto-merge.yml@main
     with:
       deploy_gate_ignore: deploy-staging-db,deploy-staging,deploy-staging-emscripten,deploy-staging-probe-unknown,deploy-staging-probe-emscripten

@@ -277,6 +277,82 @@ HTTP の値は、GET だけ受ける fetch ハンドラを一時的に足した�
 | Q5 問い合わせの流し方 | `simple_query` / `batch_execute` だけ: 通る (5/5)<br>`query_typed` (名前なし・1 往復): 通る (5/5)<br>名前付き prepared statement (`tx.execute` / `tx.query`) をトランザクションの中で: **0/5**。`set_config` の step で `unexpected_message`、またはその次の文で `closed`<br>トランザクションの外の単発: `query_typed` は ok。名前付きは回によって ok / `unexpected_message`<br>Hyperdrive の caching の有効・無効で結果は変わらなかった<br>HTTP での 3 回も同じ結果 (simple・`query_typed` は 5/5・leak 0、名前付きは 0/5) |
 | Q6 所要時間 (ms、参考値) | 1 文の往復の平均: `wrangler dev --remote` (手元の近くの拠点) で 71.7 / 72.95 / 84.75 / 122.85、定時実行で 237〜252<br>1 トランザクション (6 文前後): remote で 525〜587、定時実行で 1438〜1520<br>**`[env.staging.placement]` を入れても定時実行の値は変わらなかった (244)**<br>**HTTP (fetch) で呼ばれる worker + `placement.region`** では、1 文の往復の平均がトランザクションの中で 4.45 / 5.15 / 5.55、外で 2.8 / 3.15 / 3.8。1 トランザクション (6 文前後) は 20〜37。probe 全体 (接続 20 本) で応答 1.1〜1.3 秒。応答ヘッダ `cf-placement` は `remote-NRT` (入口は KIX / NRT) |
 
+## PGlite の probe (`probe-pglite-db/` + `probe-hyperdrive/src/pglite.rs`)
+
+staging の DB (運用機の docker の postgres + PgBouncer) を、**Durable Object の中で動く PGlite** (@electric-sql/pglite 0.5.8、
+postgres の wasm 版) に置き換えられるかを測る試作 (Refs ohishi-exp/rust-leave-worker#1)。
+
+- `probe-pglite-db/` (TS、staging: `probe-pglite-db-staging`): DO `PgliteDb`。最初の `connect` の中で PGlite を起動し、
+  ippoan/alc-migrations (版は `ALC_MIGRATIONS_REV` の 1 行) の init_local_db.sql → 空の `_sqlx_migrations` → migrations
+  (1 ファイル 1 トランザクション) → local_app_grants.sql → seed の 2 テナント (leak-a = 乗務員 7 人、leak-b = 13 人。ID は起動のたびに `gen_random_uuid()`) を流す (順は `src/steps.js`)。
+  届いた TCP の生バイトを postgres の wire protocol として `execProtocolRawStream` に 1 通ずつ流す (切り方は
+  @electric-sql/pglite-socket と同じ)。接続は 1 本ずつ直列。接続の頭で `SET SESSION AUTHORIZATION alc_api_rt`、
+  閉じるときに `RESET ALL; RESET SESSION AUTHORIZATION`。永続化しない (揮発)
+- `probe-hyperdrive/src/pglite.rs`: 定時実行の頭で `Stub::connect` → `connect_raw` (tokio-postgres は無改造) → kit の
+  `PgClient::tenant_tx` でテナントの行数を数え、1 行の JSON (`"probe":"pglite"`) を出す。期限は `pglite::EXPIRES_AT_MS` (2026-10-20)
+- **DO の connect 口に認可は無い** (到達できるのは DO binding を持つ Worker だけ。fetch は 404、workers_dev / preview_urls = false)。
+  接続は superuser の session を切り替えたものなので、接続側が `RESET SESSION AUTHORIZATION` すれば superuser に戻れる。
+  **seed の 2 テナントだけを置く測定用で、本実装の境界にはしない**
+
+### Workers で PGlite を起動するために要ったもの
+
+PGlite 0.5.8 は Workers の上ではそのままでは起動しない。この試作では次で回避した (どれも bundle の作り方の話で、PGlite は改変していない):
+
+| 止まった所 (エラーの原文) | 原因 | 回避 (`wrangler.toml` / `src/`) |
+|---|---|---|
+| `Invalid URL string.` | wasm を渡しても `new URL("./pglite.data", import.meta.url)` を無条件に作る | `[define] "import.meta.url"` に取りに行かない仮の URL |
+| `The process.binding method is not implemented` | `nodejs_compat` で `process.versions.node` が在り、node の経路に入る | `nodejs_compat` を外し、node の組み込みの動的 import は `[alias]` で空のモジュールへ |
+| `e is not a function` / `Cannot read properties of undefined (reading 'href')` | workerd は `nodejs_compat` 無しでも `process` を持つ。web worker の経路では `self.location.href` を読む | `[define]` で `process.versions.node` を `undefined`、`self.location.href` を仮の URL |
+| `INITDB failed to initialize: could not execute command ""/pglite/bin/postgres" -V": Function not implemented` → `CompileError: WebAssembly.Module(): Wasm code generation disallowed by embedder` (`dict_snowball.so` の dlopen) | Emscripten の `addFunction` (JS の関数を関数表に入れる) と拡張の side module (`.so`) の読み込みが、**実行時に wasm をコンパイルする**。Workers はこれを許さない | build 時に node で同じ流れ (起動 → migration 全量) を 1 回通し、コンパイルされた bytes (4 個、計 737,527 B) を `.prebuilt/` に書き出して同梱 (`scripts/gen-prebuilt-wasm.mjs`)。実行時は `src/wasm-shim.ts` が同じ bytes の `new WebAssembly.Module` / `WebAssembly.instantiate` を同梱のものに差し替える |
+
+bundle は 18,324 KiB / gzip 6,035 KiB (pglite.wasm 9.6 MiB・pglite.data 6.0 MiB を含む)。staging の `Worker Startup Time` は 15 ms
+(起動は最初の connect の中で遅延するので、startup の 1 秒制限には掛からない)。
+
+### 128 MiB の壁
+
+パッケージの pglite.wasm は線形メモリを `env.memory` の import で受け、**最小 2048 pages (= 128 MiB)・最大 32768 pages を宣言している**
+(initdb.wasm は最小 1024 pages = 64 MiB。こちらは起動時の initdb の間だけ使う)。PGlite の `initialMemory` は起動時に確保する量で、
+宣言の最小より小さくすると `LinkError: … memory import has 256 pages which is smaller than the declared initial of 2048` で起動しない。
+つまり**そのままでは wasm のメモリだけで isolate の上限 (128 MB) と同じ大きさを使う**。
+
+この試作では、build 時に pglite.wasm の memory の宣言の最小だけを 512 pages (32 MiB) に書き換えた版を同梱し
+(`scripts/gen-prebuilt-wasm.mjs`。コード・data は変えない)、`initialMemory` を 32 MiB にしている (`src/steps.js` の `PGLITE_INITIAL_MIB`)。
+足りなければ wasm が自分で伸ばす。ローカル (node・workerd) では、これで起動・migration 全量・RLS がすべて通った (下の表)。
+node で最小を変えて試した値: 64 MiB → migration 後も 64 MiB / 32 MiB → 38.4 MiB / 16 MiB → 起動で 32.6 MiB・migration 後 39.1 MiB。
+**Cloudflare 上でこの版が動くかは未確認** (staging で実行を観測できていない。下)。
+
+### 結果
+
+2026-10-13 の実測。**ローカル (`wrangler dev` = workerd、probe-hyperdrive と probe-pglite-db を `-c` で 1 プロセスに並べた) では 4 点とも通った。
+staging では実行を観測できていない** (下)。値は memory の宣言を書き換えた版 (initialMemory 32 MiB)。括弧内は書き換え前 (128 MiB) の版。
+
+| 点 | ローカル (workerd) | staging |
+|---|---|---|
+| 1. DO 上で起動するか・起動時間 | 起動する。`PGlite.create` から ready まで 911 ms (1,021 ms)。Worker から見た 1 本目の接続 (起動・migration・seed 込み) は 1,319 ms (1,429 ms)、起きている DO への接続は 3〜13 ms | 未観測 |
+| 2. メモリ | PGlite の wasm の線形メモリ (`HEAPU8.length`) は起動直後 33,554,432 B (32 MiB)、migration・seed の後 40,304,640 B (38.4 MiB)。書き換え前の版は 134,217,728 B (128 MiB、宣言の最小) から増えず。**これは wasm のメモリだけで isolate 全体ではない** (JS の heap・同梱の module・起動時の initdb の 64 MiB は入っていない)。既定の設定 (`shared_buffers=128MB`) では起動しただけで 197,722,112 B に伸びた (node) ので、`shared_buffers=8MB` ほかを絞っている | 未観測 (`Exceeded Memory Limit` の有無は見られていない) |
+| 3. migration 全量 | rev 96f420d の 166 本すべて通った。migration だけで 356 ms (347 ms)、grants・seed 込みで 371 ms (node でも 317〜340 ms) | 未観測 |
+| 4. Rust から RLS 付きで query_typed | `current_user` = `alc_api_rt`。テナントの ID を名前で引き、`tenant_tx(A)` で 7 行、`tenant_tx(B)` で 13 行、`tenant_tx(A)` の中で B を名指しして 0 行 (`isolated: true`)。1 tx 1〜3 ms。tenant を設定しない読みはエラー (1 回目 `42704: unrecognized configuration parameter "app.current_tenant_id"`、2 回目以降 `22P02: invalid input syntax for type uuid: ""`) で、行は見えない | 未観測 |
+
+- tenant 未設定のエラーが 1 回目と 2 回目で違うのは、**DO の中の postgres の session が 1 本で、接続をまたいで使い回される**ため
+  (前の接続の `set_config` で `app.current_tenant_id` が定義済みになり、`RESET ALL` の後は空文字に戻る)。`RESET` で消えない
+  session の状態 (定義済みの GUC など) は次の接続に持ち越される
+- **staging で止まった所** (配信・`dev --remote` は合計 5 回):
+  - `wrangler dev --remote --env staging --test-scheduled` (probe-hyperdrive) からの `Stub::connect` は `connect cold: handshake: closed`
+    で終わり、`probe-pglite-db-staging` の tail には何も来なかった (DO の `connect` に届いていない)
+  - probe-pglite-db-staging と probe-hyperdrive-staging (cron `* * * * *`) を配信し、両方に `wrangler tail` を張った。
+    tail は `Connected to …, waiting for logs...` まで繋がったが、**1 回目は約 8 分、2 回目 (書き換えた版) は約 7 分、イベントが 1 件も来なかった**。
+    probe-hyperdrive 自身の定時実行のイベント (`{"probe":"hyperdrive","expired":true}` を含む) も来ていないので、DO の手前
+    (定時実行が起きていないか、tail に届いていないか) で止まっていて、`Exceeded Memory Limit` かどうかは判定できない
+  - 測った後に両方 `wrangler delete --env staging` で消した
+
+### 今後
+
+- DO のメモリの上限を 256 / 512 MB にする設定 `limits.durable_object_memory_mb` が Wrangler の Draft PR にある
+  (cloudflare/workers-sdk#16164、2026-10-08 時点で未マージ・ドキュメント無し)。出たら、書き換えない版 (128 MiB) を 256 MB で試せる
+- staging での観測は、定時実行ではなく fetch で呼ぶ口 (Access で守った workers.dev) を一時的に足すか、Workers Logs を読める token で
+  Observability を読む形にする (どちらもこの試作ではしていない)
+
+
 ## 構成
 
 ```

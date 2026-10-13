@@ -10,6 +10,8 @@
 //! - 既存の系列 (PoC) の後ろに、共通 crate `alc-worker-db` (ippoan/alc-worker-kit) をそのまま通す系列 ([`Kit`]) を流す
 //!   (Refs ippoan/rust-alc-api#723)。
 //! - [`EXPIRES_AT_MS`] を過ぎたら DB に繋がない。
+//! - Hyperdrive の系列の前に、DO (probe-pglite-db) の中の PGlite へ繋ぐ系列 ([`pglite`]) を流し、別の 1 行で出す
+//!   (期限は [`pglite::EXPIRES_AT_MS`] で、Hyperdrive の系列とは別)。
 
 #![deny(
     clippy::unwrap_used,
@@ -30,6 +32,8 @@ use tokio_postgres::types::{ToSql, Type};
 use tokio_postgres::{Client, Config, Error as PgError, SimpleQueryMessage};
 use uuid::Uuid;
 use worker::postgres_tls::PassthroughTls;
+mod pglite;
+
 use worker::{
     console_log, event, Date, Env, ScheduleContext, ScheduledEvent, SecureTransport, Socket,
 };
@@ -797,6 +801,12 @@ impl Probe<'_> {
 /// 外へ Err を返さない (未捕捉の例外としてエラーの文がログに残るため)
 #[event(scheduled)]
 async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
+    if now() < pglite::EXPIRES_AT_MS {
+        match serde_json::to_string(&pglite::run(&env).await) {
+            Ok(line) => console_log!("{line}"),
+            Err(_) => console_log!(r#"{{"probe":"pglite","errors":["serialize"]}}"#),
+        }
+    }
     if now() >= EXPIRES_AT_MS {
         console_log!(r#"{{"probe":"hyperdrive","expired":true}}"#);
         return;
