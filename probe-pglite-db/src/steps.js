@@ -18,6 +18,11 @@ export const SEED_TENANTS = [
 /// 足りなければ wasm が自分で伸ばす (ローカルの実測で migration 全量の後 約 38 MiB)
 export const PGLITE_INITIAL_MIB = 32;
 
+/// build 時に datadir を作る initdb の引数 (scripts/gen-prebuilt-wasm.mjs)。WAL のセグメントを 16 → 1 MiB にし、initdb が
+/// 中で動かす postgres にも小さい設定を渡す。DO は出来た datadir を loadDataDir で読むだけで、実行時に initdb を走らせない
+/// (initdb を DO で動かすと、起動中に initdb.wasm の 64 MiB と既定の shared_buffers のぶんが重なって isolate の上限を超えた)
+export const INITDB_PARAMS = ["--wal-segsize=1", "-c", "shared_buffers=8MB", "-c", "max_connections=5"];
+
 /// postgres の設定。既定の shared_buffers (128MB) だと起動だけで wasm のメモリが 約 190 MiB まで伸びる (ローカルの node の実測)
 export const POSTGRESQL_CONF = [
   "shared_buffers=8MB",
@@ -25,6 +30,7 @@ export const POSTGRESQL_CONF = [
   "maintenance_work_mem=4MB",
   "temp_buffers=1MB",
   "wal_buffers=1MB",
+  "max_connections=5",
 ];
 
 /// sqlx ではなく SQL で流すので表だけ作る (migration 160 の migration_status() が参照する。中身は空)

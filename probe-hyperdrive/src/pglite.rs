@@ -8,14 +8,24 @@
 //!   **このため DB のエラーは SQLSTATE に加えて DB の message も出す** (Hyperdrive の系列とは違い、宛先・認証情報を
 //!   含みうる本物の DB ではない。失敗の原文を残すのがこの系列の目的)
 //! - Hyperdrive の系列とは独立に、[`EXPIRES_AT_MS`] まで動く
+//! - 待ちには上限を付ける ([`ECHO_TIMEOUT_MS`]・[`CONNECT_TIMEOUT_MS`]・[`MEASURE_TIMEOUT_MS`])。DO が応答しなくても
+//!   定時実行が終わり、ログ (`error` が `timeout:<段>`) が必ず出るようにする
+//! - handshake の前に、生の `Socket` に固定のバイト列を書いて読み戻す echo を 1 回測る ([`echo`])。probe-pglite-db を
+//!   `PGLITE_MODE = "echo"` で配信すると、PGlite を起動せずにバイトをそのまま返すので、JS の DO の connect 経路だけを白黒できる
+//!   (通常の PGlite のモードでは、echo は応答が返らずに [`ECHO_TIMEOUT_MS`] で切れる)
+
+use std::future::Future;
+use std::time::Duration;
 
 use alc_worker_db::{kind, PgClient};
+use futures_util::future::{select, Either};
 use serde::Serialize;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_postgres::config::SslMode;
 use tokio_postgres::types::{ToSql, Type};
 use tokio_postgres::{Client, Config, Error as PgError, NoTls, SimpleQueryMessage};
 use uuid::Uuid;
-use worker::{console_log, Date, Env};
+use worker::{console_log, Date, Delay, Env, Socket};
 
 const BINDING: &str = "PGLITE_DB";
 /// 1 個の DO (= 1 個の PGlite) に集める
@@ -32,10 +42,29 @@ const EXPECTED_B: i64 = 13;
 const COUNT_ALL: &str = "SELECT count(*) FROM alc_api.employees";
 const COUNT_OF: &str = "SELECT count(*) FROM alc_api.employees WHERE tenant_id = $1";
 const TENANT_ID: &str = "SELECT id FROM alc_api.tenants WHERE name = $1";
+/// echo で書いて読み戻すバイト列
+const ECHO_PAYLOAD: &[u8] = b"probe-pglite-echo";
+const ECHO_TIMEOUT_MS: u64 = 10_000;
+/// 1 本の接続 (Stub::connect から handshake まで) の待ちの上限
+const CONNECT_TIMEOUT_MS: u64 = 20_000;
+/// 接続 2 本と問い合わせ全体の待ちの上限
+const MEASURE_TIMEOUT_MS: u64 = 45_000;
+
+#[derive(Default, Serialize)]
+struct Echo {
+    /// 書いたバイト列がそのまま返ったか
+    ok: bool,
+    /// Stub::connect から読み戻すまでの ms
+    ms: Option<u64>,
+    /// 失敗の段 (`socket` / `write: <ErrorKind>` / `read: <ErrorKind>` / `mismatch` / `timeout:echo`)
+    error: Option<String>,
+}
 
 #[derive(Default, Serialize)]
 pub struct Report {
     probe: &'static str,
+    /// 生の Socket の echo (PGLITE_MODE = "echo" の DO なら ok)
+    echo: Echo,
     /// 1 本目の接続 (DO の起動 = PGlite の起動・migration を含む) と 2 本目の接続の ms (handshake まで)
     connect_cold_ms: Option<u64>,
     connect_warm_ms: Option<u64>,
@@ -70,15 +99,66 @@ fn describe(e: &PgError) -> String {
     }
 }
 
-async fn connect(env: &Env) -> Result<Client, String> {
-    let ns = env
-        .durable_object(BINDING)
-        .map_err(|_| "binding".to_owned())?;
-    let socket = ns
+/// `fut` を `ms` まで待つ。超えたら `timeout:<step>`
+async fn within<T>(
+    ms: u64,
+    step: &str,
+    fut: impl Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    match select(Box::pin(fut), Delay::from(Duration::from_millis(ms))).await {
+        Either::Left((result, _)) => result,
+        Either::Right(_) => Err(format!("timeout:{step}")),
+    }
+}
+
+fn open_socket(env: &Env) -> Result<Socket, String> {
+    env.durable_object(BINDING)
+        .map_err(|_| "binding".to_owned())?
         .get_by_name(DO_NAME)
         .map_err(|_| "stub".to_owned())?
         .connect(&format!("{DO_NAME}:5432"))
-        .map_err(|_| "socket".to_owned())?;
+        .map_err(|_| "socket".to_owned())
+}
+
+/// 生の Socket に [`ECHO_PAYLOAD`] を書き、同じ長さを読み戻す
+async fn echo(env: &Env) -> Echo {
+    let started = now();
+    let result = within(ECHO_TIMEOUT_MS, "echo", async {
+        let mut socket = open_socket(env)?;
+        socket
+            .write_all(ECHO_PAYLOAD)
+            .await
+            .map_err(|e| format!("write: {:?}", e.kind()))?;
+        socket
+            .flush()
+            .await
+            .map_err(|e| format!("flush: {:?}", e.kind()))?;
+        let mut back = vec![0u8; ECHO_PAYLOAD.len()];
+        socket
+            .read_exact(&mut back)
+            .await
+            .map_err(|e| format!("read: {:?}", e.kind()))?;
+        let _ = socket.shutdown().await;
+        if back == ECHO_PAYLOAD {
+            Ok(())
+        } else {
+            Err("mismatch".to_owned())
+        }
+    })
+    .await;
+    Echo {
+        ok: result.is_ok(),
+        ms: result.is_ok().then(|| now().saturating_sub(started)),
+        error: result.err(),
+    }
+}
+
+async fn connect(env: &Env) -> Result<Client, String> {
+    within(CONNECT_TIMEOUT_MS, "connect", connect_inner(env)).await
+}
+
+async fn connect_inner(env: &Env) -> Result<Client, String> {
+    let socket = open_socket(env)?;
     let mut config = Config::new();
     // ロールは DO が接続の頭で SET SESSION AUTHORIZATION する (ここの user は PGlite が使わない)
     config
@@ -191,7 +271,8 @@ pub async fn run(env: &Env) -> Report {
         probe: "pglite",
         ..Report::default()
     };
-    if let Err(e) = measure(env, &mut r).await {
+    r.echo = echo(env).await;
+    if let Err(e) = within(MEASURE_TIMEOUT_MS, "measure", measure(env, &mut r)).await {
         r.error = Some(e);
     }
     r.isolated = r.is_runtime_role == Some(true)

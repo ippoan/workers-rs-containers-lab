@@ -3,16 +3,18 @@
 //
 // 1. pglite.wasm の線形メモリの宣言 (`env.memory` の import の最小 2048 pages = 128 MiB。isolate の上限 128 MB と同じ) を
 //    PGLITE_INITIAL_MIB (src/steps.js) に書き換えた版を .prebuilt/pglite.wasm に出す。中身 (コード・data) は変えない
-// 2. Workers は実行時の wasm のコンパイル (`new WebAssembly.Module(bytes)`・`WebAssembly.instantiate(bytes)`) を許さない。
+// 2. 空の datadir (initdb だけ済ませ、template0 / template1 を消したもの) を gzip の tar で .prebuilt/datadir.tar.gz に出す。
+//    DO はこれを loadDataDir で読み、実行時に initdb を走らせない (migration・seed は DO が起動のたびに流す)
+// 3. Workers は実行時の wasm のコンパイル (`new WebAssembly.Module(bytes)`・`WebAssembly.instantiate(bytes)`) を許さない。
 //    PGlite (Emscripten) は起動と migration の途中で 2 種類の wasm を bytes からコンパイルする:
 //      - `addFunction` が JS の関数を関数表に入れるために作る、シグネチャごとの小さな module
 //      - pglite.data の中の拡張 (dict_snowball.so・plpgsql.so 等の side module) を dlopen するとき
-//    node で DO と同じ流れ (1 の版で起動 → migration 全量 → RLS 付きの読み) を 1 回通してその bytes を捕まえ、.prebuilt/ に
+//    node で DO と同じ流れ (1 の版と 2 の datadir で起動 → migration 全量 → RLS 付きの読み) を 1 回通してその bytes を捕まえ、.prebuilt/ に
 //    .wasm として書き出す (bundle に CompiledWasm で入る)。実行時は src/wasm-shim.ts が、同じ bytes のコンパイルを同梱のものに差し替える
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { PGlite } from "@electric-sql/pglite";
-import { PGLITE_INITIAL_MIB, POSTGRESQL_CONF, RUNTIME_ROLE, SEED_TENANTS, setupSteps } from "../src/steps.js";
+import { INITDB_PARAMS, PGLITE_INITIAL_MIB, POSTGRESQL_CONF, RUNTIME_ROLE, SEED_TENANTS, setupSteps } from "../src/steps.js";
 import { wasmKey } from "../src/wasm-key.js";
 
 const require = createRequire(import.meta.url);
@@ -88,11 +90,21 @@ WebAssembly.instantiate = (src, ...rest) => {
   return originalInstantiate(src, ...rest);
 };
 
-const db = await PGlite.create({
+const base = {
   pgliteWasmModule: new OriginalModule(patched.bytes),
   initialMemory: PGLITE_INITIAL_MIB * 1024 * 1024,
   postgresqlconf: POSTGRESQL_CONF,
-});
+};
+// 2. 空の datadir。PGlite の dump はこの版の PGlite 専用 (版をまたいで読めない) なので、build のたびに作り直す
+const maker = await PGlite.create({ ...base, initDbStartParams: INITDB_PARAMS });
+await maker.exec("UPDATE pg_database SET datistemplate = false WHERE datname IN ('template0', 'template1')");
+await maker.exec("DROP DATABASE template0");
+await maker.exec("DROP DATABASE template1");
+await maker.exec("CHECKPOINT");
+const dataDir = new Uint8Array(await (await maker.dumpDataDir("gzip")).arrayBuffer());
+await maker.close();
+
+const db = await PGlite.create({ ...base, loadDataDir: new Blob([dataDir]) });
 for (const step of setupSteps(bundle)) await db.exec(step.sql);
 await db.exec(`SET SESSION AUTHORIZATION ${RUNTIME_ROLE}`);
 const counts = [];
@@ -112,6 +124,7 @@ await db.close();
 rmSync(out, { recursive: true, force: true });
 mkdirSync(out, { recursive: true });
 writeFileSync(new URL("pglite.wasm", out), patched.bytes);
+writeFileSync(new URL("datadir.tar.gz", out), dataDir);
 const keys = [...captured.keys()].sort();
 keys.forEach((key, i) => writeFileSync(new URL(`m${i}.wasm`, out), captured.get(key)));
 writeFileSync(
@@ -125,5 +138,5 @@ writeFileSync(
 const total = keys.reduce((n, k) => n + captured.get(k).length, 0);
 console.log(
   `pglite.wasm の memory の最小を ${patched.from} → ${PGLITE_INITIAL_MIB * 16} pages に書き換え、` +
-    `実行時にコンパイルされる wasm ${keys.length} 個 (${total} bytes) と一緒に .prebuilt/ に書き出した`,
+    `空の datadir (gzip ${dataDir.length} bytes)・実行時にコンパイルされる wasm ${keys.length} 個 (${total} bytes) と一緒に .prebuilt/ に書き出した`,
 );
